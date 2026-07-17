@@ -3,7 +3,16 @@
 Agent Loop Visualizer — Groundweave: Multi-Agent Architecture Research
 Real timeline from 2026-07-17 18:03–18:55
 """
-import json, time, threading, sys, os
+import copy
+import json
+import math
+import os
+import queue
+import random
+import socket
+import sys
+import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
@@ -11,7 +20,28 @@ from urllib.parse import urlparse
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8766
+try:
+    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8766
+except (TypeError, ValueError):
+    raise SystemExit("PORT must be an integer")
+if not 1 <= PORT <= 65535:
+    raise SystemExit("PORT must be between 1 and 65535")
+
+MAX_CONTENT_LENGTH = 64 * 1024
+MAX_SSE_CLIENTS = 32
+REQUEST_TIMEOUT = 10
+SSE_HEARTBEAT_INTERVAL = 15
+SSE_WRITE_TIMEOUT = 10
+
+
+def normalize_path_prefix(value):
+    value = (value or "").strip().strip("/")
+    if not value:
+        return ""
+    return "/" + value
+
+
+PATH_PREFIX = normalize_path_prefix(os.environ.get("AGENT_VIZ_PATH_PREFIX", ""))
 
 # ── Multi-Agent Research: Actual Timeline ──────────────────────
 # Timestamps: 18:03–18:55 HKT, 2026-07-17
@@ -22,14 +52,14 @@ STATE = {
     "total_tokens": 0,
     "total_cost": 0.0,
     "loop_state": {
-        "done": 0, "total": 10, "blocked": [], "summary": "",
+        "done": 0, "total": 12, "blocked": [], "summary": "",
         "passes": 0, "new_glossary": 0, "new_people": 0, "new_reading": 0,
     },
     "nodes": [
         # Row 1: Pre-Flight
         {"id": "orch", "label": "Pre-Flight", "x": 450, "y": 35,
          "status": "pending", "tokens": 0, "task": "Plan audit, scope, pre-flight checklist"},
-        # Row 2: Launch 1 Source Farm (3 groups, parallel)
+        # Row 2: Launch 1 Source Farm (3 groups, processed serially)
         {"id": "f1", "label": "Farm: Frameworks", "x": 130, "y": 145,
          "status": "pending", "tokens": 0, "task": "LangGraph,CrewAI,AutoGen,OpenAI,Anthropic (5 subagents)"},
         {"id": "f2", "label": "Farm: Deep-Dives", "x": 450, "y": 145,
@@ -77,90 +107,309 @@ STATE = {
     "logs": [],
 }
 
-STATUS_COLORS = {
-    "pending": "#eaeef2", "queued": "#fff3cd", "running": "#fff8e1",
-    "done": "#dafbe1", "blocked": "#ffd8d8", "warning": "#ffe8cc",
-}
-
-STATE_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()
 SSE_CLIENTS = []
 CONTROL = {"paused": False, "speed": 1.0, "running": False}
+NODE_COUNT = len(STATE["nodes"])
 
 
-def wait_tick(s):
-    remaining = s / CONTROL["speed"]
-    while remaining > 0:
-        if not CONTROL["running"]:
-            return
-        while CONTROL["paused"] and CONTROL["running"]:
-            time.sleep(0.1)
-            broadcast()
-        chunk = min(0.1, remaining)
-        time.sleep(chunk)
-        remaining -= chunk
-    STATE["elapsed"] = int(time.time() - _sim_start)
-    broadcast()
+class RunCancelled(Exception):
+    """Raised when a simulation loses ownership of the active run."""
+
+
+class RunContext:
+    def __init__(self, generation):
+        self.generation = generation
+        self.cancel = threading.Event()
+        self.thread = None
+        self.started_at = 0.0
+        self.paused_since = None
+        self.paused_total = 0.0
+
+
+_thread_context = threading.local()
+_run_lifecycle_lock = threading.Lock()
+_active_context = None
+_run_generation = 0
+_sse_event_id = 0
+
+
+def current_context():
+    return getattr(_thread_context, "run", None)
+
+
+def _is_current_locked(context):
+    return (
+        context is None
+        or (
+            context is _active_context
+            and context.generation == _run_generation
+            and CONTROL["running"]
+            and not context.cancel.is_set()
+        )
+    )
+
+
+def ensure_current(context=None):
+    context = current_context() if context is None else context
+    if context is None:
+        return
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+
+
+def state_snapshot():
+    """Copy state while locked; callers may serialize the copy without the lock."""
+    with STATE_LOCK:
+        return copy.deepcopy(STATE)
+
+
+def _elapsed_for_locked(context, now=None):
+    if not context.started_at:
+        return 0
+    now = time.monotonic() if now is None else now
+    paused = context.paused_total
+    if context.paused_since is not None:
+        paused += now - context.paused_since
+    return max(0, int(now - context.started_at - paused))
+
+
+def update_elapsed(context):
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        STATE["elapsed"] = _elapsed_for_locked(context)
+
+
+def _sse_payload(snapshot, event_id):
+    data = json.dumps(snapshot, separators=(",", ":"))
+    return f"id: {event_id}\ndata: {data}\n\n"
 
 
 def broadcast():
-    data = json.dumps(STATE)
+    global _sse_event_id
+    with STATE_LOCK:
+        snapshot = copy.deepcopy(STATE)
+        _sse_event_id += 1
+        event_id = _sse_event_id
+        clients = tuple(SSE_CLIENTS)
+    payload = _sse_payload(snapshot, event_id)
     dead = []
-    for q in SSE_CLIENTS:
+    for client_queue in clients:
         try:
-            q.put(data)
-        except Exception:
-            dead.append(q)
-    for d in dead:
-        SSE_CLIENTS.remove(d)
+            client_queue.put_nowait(payload)
+        except queue.Full:
+            # Keep only the newest full snapshot for slow clients.
+            try:
+                client_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                client_queue.put_nowait(payload)
+            except queue.Full:
+                dead.append(client_queue)
+        except (RuntimeError, OSError):
+            dead.append(client_queue)
+    if dead:
+        with STATE_LOCK:
+            for client_queue in dead:
+                if client_queue in SSE_CLIENTS:
+                    SSE_CLIENTS.remove(client_queue)
+
+
+def current_sse_snapshot(last_event_id=None):
+    global _sse_event_id
+    with STATE_LOCK:
+        if last_event_id is not None:
+            _sse_event_id = max(_sse_event_id, last_event_id)
+        _sse_event_id += 1
+        event_id = _sse_event_id
+        snapshot = copy.deepcopy(STATE)
+    return _sse_payload(snapshot, event_id)
+
+
+def add_sse_client(client_queue):
+    with STATE_LOCK:
+        if len(SSE_CLIENTS) >= MAX_SSE_CLIENTS:
+            return False
+        SSE_CLIENTS.append(client_queue)
+        return True
+
+
+def remove_sse_client(client_queue):
+    with STATE_LOCK:
+        if client_queue in SSE_CLIENTS:
+            SSE_CLIENTS.remove(client_queue)
+
+
+def set_paused(paused):
+    now = time.monotonic()
+    with STATE_LOCK:
+        context = _active_context
+        if paused and not CONTROL["paused"]:
+            CONTROL["paused"] = True
+            if context is not None and context.started_at and context.paused_since is None:
+                context.paused_since = now
+        elif not paused and CONTROL["paused"]:
+            CONTROL["paused"] = False
+            if context is not None and context.paused_since is not None:
+                context.paused_total += now - context.paused_since
+                context.paused_since = None
+    broadcast()
+
+
+def toggle_paused():
+    now = time.monotonic()
+    with STATE_LOCK:
+        context = _active_context
+        paused = not CONTROL["paused"]
+        if paused:
+            CONTROL["paused"] = True
+            if context is not None and context.started_at and context.paused_since is None:
+                context.paused_since = now
+        else:
+            CONTROL["paused"] = False
+            if context is not None and context.paused_since is not None:
+                context.paused_total += now - context.paused_since
+                context.paused_since = None
+    broadcast()
+
+
+def set_speed(speed):
+    with STATE_LOCK:
+        CONTROL["speed"] = speed
+    broadcast()
+
+
+def wait_tick(s, context=None):
+    context = current_context() if context is None else context
+    remaining = float(s)
+    while remaining > 0:
+        ensure_current(context)
+        with STATE_LOCK:
+            paused = CONTROL["paused"]
+            speed = CONTROL["speed"]
+        if paused:
+            if context.cancel.wait(0.1):
+                raise RunCancelled
+            continue
+        chunk = min(0.1, remaining / speed)
+        if context.cancel.wait(chunk):
+            raise RunCancelled
+        remaining -= chunk * speed
+    update_elapsed(context)
+    broadcast()
 
 
 def update_node(nid, **kwargs):
-    for n in STATE["nodes"]:
-        if n["id"] == nid:
-            for k, v in kwargs.items():
-                n[k] = v
-            break
+    context = current_context()
+    ensure_current(context)
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        for n in STATE["nodes"]:
+            if n["id"] == nid:
+                n.update(kwargs)
+                return
+
+
+def complete_node(nid):
+    context = current_context()
+    ensure_current(context)
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        for n in STATE["nodes"]:
+            if n["id"] == nid:
+                if n["status"] != "done":
+                    n["status"] = "done"
+                    STATE["loop_state"]["done"] += 1
+                return
 
 
 def add_log(msg: str):
+    context = current_context()
+    ensure_current(context)
     t = time.strftime("%H:%M:%S")
-    STATE["logs"].append(f"[{t}] {msg}")
-    if len(STATE["logs"]) > 14:
-        STATE["logs"] = STATE["logs"][-14:]
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        STATE["logs"].append(f"[{t}] {msg}")
+        if len(STATE["logs"]) > 14:
+            STATE["logs"] = STATE["logs"][-14:]
+
+
+def update_loop_state(**kwargs):
+    context = current_context()
+    ensure_current(context)
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        STATE["loop_state"].update(kwargs)
+
+
+def increment_loop_state(field, amount):
+    context = current_context()
+    ensure_current(context)
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        STATE["loop_state"][field] += amount
 
 
 def burn_tokens(nid, tick_count, tok_range, delay=0.6):
+    context = current_context()
     lo, hi = tok_range
     for _ in range(tick_count):
-        import random
+        ensure_current(context)
         tok = random.randint(lo, hi)
-        STATE["total_tokens"] += tok
-        STATE["total_cost"] = round(STATE["total_tokens"] / 1000000 * 0.435, 4)
+        with STATE_LOCK:
+            if not _is_current_locked(context):
+                raise RunCancelled
+            STATE["total_tokens"] += tok
+            STATE["total_cost"] = round(STATE["total_tokens"] / 1000000 * 0.435, 4)
+            for n in STATE["nodes"]:
+                if n["id"] == nid:
+                    n["tokens"] += tok
+                    break
+        wait_tick(delay, context)
+
+
+def reset_state(context):
+    ensure_current(context)
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        STATE["elapsed"] = 0
+        STATE["total_tokens"] = 0
+        STATE["total_cost"] = 0.0
+        STATE["loop_state"] = {
+            "done": 0, "total": NODE_COUNT, "blocked": [], "summary": "",
+            "passes": 0, "new_glossary": 0, "new_people": 0, "new_reading": 0,
+        }
         for n in STATE["nodes"]:
-            if n["id"] == nid:
-                n["tokens"] += tok
-                break
-        wait_tick(delay)
+            n["status"] = "pending"
+            n["tokens"] = 0
+        STATE["logs"] = []
 
 
-_sim_start = 0.0
+def metrics_snapshot():
+    with STATE_LOCK:
+        return STATE["total_tokens"], STATE["total_cost"]
 
 
-def simulate_loop():
-    global _sim_start
-    _sim_start = time.time()
-    CONTROL["running"] = True
+def simulate_loop(context):
+    with STATE_LOCK:
+        if not _is_current_locked(context):
+            raise RunCancelled
+        context.started_at = time.monotonic()
+        if CONTROL["paused"]:
+            context.paused_since = context.started_at
+    _thread_context.run = context
 
     # Reset
-    STATE["elapsed"] = 0
-    STATE["total_tokens"] = 0
-    STATE["total_cost"] = 0.0
-    STATE["loop_state"] = {"done": 0, "total": 10, "blocked": [], "summary": "",
-                           "passes": 0, "new_glossary": 0, "new_people": 0, "new_reading": 0}
-    for n in STATE["nodes"]:
-        n["status"] = "pending"
-        n["tokens"] = 0
-    STATE["logs"] = []
+    reset_state(context)
     broadcast()
 
     # ══════════════ PHASE 0: PRE-FLIGHT (18:03–18:09) ══════════════
@@ -174,8 +423,7 @@ def simulate_loop():
     add_log("Domain probe: 9/9 HTTP 200 ✅ · Budget: 4 passes, 200 Brave, 2h")
     wait_tick(0.5)
     add_log("18:09 Pre-flight complete. /background Launch 1 → 12 subagents")
-    update_node("orch", status="done")
-    STATE["loop_state"]["done"] = 1
+    complete_node("orch")
     wait_tick(0.4)
 
     # ══════════════ PHASE 1: LAUNCH 1 FARM (18:09–18:18, 12 subagents) ══════════════
@@ -185,16 +433,15 @@ def simulate_loop():
 
     # Farm 1 — Frameworks (5 subagents: LangGraph, CrewAI, AutoGen, OpenAI, Anthropic)
     update_node("f1", status="running")
-    add_log("18:09 Farm:Frameworks — dispatching 5 deep-dives in parallel...")
+    add_log("18:09 Farm:Frameworks — processing 5 deep-dives serially...")
     wait_tick(0.8)
     burn_tokens("f1", 4, (5000, 9000), 1.2)
     add_log("18:15 3/5 done: autogen, crewai, langgraph ~85KB")
     wait_tick(0.6)
     burn_tokens("f1", 3, (4000, 7000), 1.0)
     add_log("18:16 5/5 done: +openai-agents, anthropic-patterns ~120KB total")
-    update_node("f1", status="done")
+    complete_node("f1")
     add_log("Farm:Frameworks ✅ 5 subagents · ~120KB")
-    STATE["loop_state"]["done"] = 2
     wait_tick(0.3)
 
     # Farm 2 — Deep-Dives (4 subagents: orchestration, protocols, production, commercial)
@@ -206,9 +453,8 @@ def simulate_loop():
     wait_tick(0.5)
     burn_tokens("f2", 2, (3000, 5000), 0.8)
     add_log("18:17 +commercial-landscape, frameworks-comparison")
-    update_node("f2", status="done")
+    complete_node("f2")
     add_log("Farm:DeepDives ✅ 4 subagents · ~100KB")
-    STATE["loop_state"]["done"] = 3
     wait_tick(0.3)
 
     # Farm 3 — Ecosystem (3 subagents: China, Key People, Bee/Meta)
@@ -217,10 +463,9 @@ def simulate_loop():
     wait_tick(0.6)
     burn_tokens("f3", 3, (3000, 6000), 1.0)
     add_log("18:17 3/3: china-ecosystem, key-people, bee-agent ~80KB")
-    update_node("f3", status="done")
+    complete_node("f3")
     add_log("Farm:Ecosystem ✅ 3 subagents · ~80KB")
     add_log("18:18 🎯 LAUNCH 1: 12/12 subagents complete · ~300KB raw research")
-    STATE["loop_state"]["done"] = 4
     wait_tick(0.4)
 
     # ══════════════ PHASE 2: INTEGRATION 1 (18:18–18:29) ══════════════
@@ -239,13 +484,12 @@ def simulate_loop():
     add_log("18:22 Gate 1: DECISIONS_NEEDED.md — 3 blockers, 3 assumptions")
     wait_tick(0.4)
     add_log("18:25 Gate 1 approved: dim-grouping keep, focus multi-agent collab, pull CN people")
-    update_node("integ", status="done")
+    complete_node("integ")
     add_log("Integration ✅ v1: 16T/10P/27R")
-    STATE["loop_state"]["done"] = 5
     wait_tick(0.4)
 
     # ══════════════ PHASE 3: REINFORCE PASS 1 (18:29–18:33, 3×3=9 subagents) ══════════════
-    STATE["loop_state"]["passes"] = 1
+    update_loop_state(passes=1)
     for rid in ["rA1", "rB1", "rC1"]:
         update_node(rid, status="queued")
     wait_tick(0.4)
@@ -256,8 +500,8 @@ def simulate_loop():
     wait_tick(0.8)
     burn_tokens("rA1", 3, (4000, 7000), 1.0)
     add_log("Loop A: found origin/coiners for all 16 terms → +22 new Key People")
-    STATE["loop_state"]["new_people"] = 22
-    update_node("rA1", status="done")
+    update_loop_state(new_people=22)
+    complete_node("rA1")
     add_log("P1 Loop A ✅ +22 people")
     wait_tick(0.3)
 
@@ -267,12 +511,12 @@ def simulate_loop():
     wait_tick(0.7)
     burn_tokens("rB1", 3, (3000, 6000), 1.0)
     add_log("Loop B: Framework Creators → +17 new terms (Context Engineering, Ambient Agents...))")
-    STATE["loop_state"]["new_glossary"] += 17
+    increment_loop_state("new_glossary", 17)
     add_log("Big Tech + Academic → +10 more terms (SWE-bench, MAST, 扣子空间...))")
-    STATE["loop_state"]["new_glossary"] += 10
-    update_node("rB1", status="done")
+    increment_loop_state("new_glossary", 10)
+    complete_node("rB1")
     add_log("P1 Loop B ✅ +27 terms, +4 readings")
-    STATE["loop_state"]["new_reading"] = 4
+    update_loop_state(new_reading=4)
     wait_tick(0.3)
 
     # P1 Loop C: Reading→Authors+Terms (2 groups)
@@ -281,19 +525,18 @@ def simulate_loop():
     wait_tick(0.7)
     burn_tokens("rC1", 3, (4000, 8000), 1.0)
     add_log("Loop C: +68 specialized terms from article content")
-    STATE["loop_state"]["new_glossary"] += 68
+    increment_loop_state("new_glossary", 68)
     add_log("+10+ new people from author bios (Dario Amodei, Zhang Yiming, etc.)")
-    STATE["loop_state"]["new_people"] += 10
-    update_node("rC1", status="done")
+    increment_loop_state("new_people", 10)
+    complete_node("rC1")
     add_log("P1 Loop C ✅ +68 terms, +10 people")
     wait_tick(0.4)
 
-    STATE["loop_state"]["done"] = 6
     add_log("18:33 REINFORCE P1: +80T/+22P/+4R (cross-ref burst!) → 🟢 continue")
     wait_tick(0.4)
 
     # ══════════════ PHASE 4: REINFORCE PASS 2 (18:36–18:41, 3 subagents) ══════════════
-    STATE["loop_state"]["passes"] = 2
+    update_loop_state(passes=2)
     for rid in ["rA2", "rB2", "rC2"]:
         update_node(rid, status="queued")
     wait_tick(0.4)
@@ -303,24 +546,23 @@ def simulate_loop():
     wait_tick(0.7)
     burn_tokens("rA2", 2, (3000, 5000), 0.8)
     add_log("Fix: 'Context Engineering' was Tobi Lütke (Shopify), not Chase. Chase popularized it.")
-    update_node("rA2", status="done")
+    complete_node("rA2")
     add_log("P2 Loop A ✅ 16 term origins confirmed (detail-fill, no new cross-refs)")
 
     update_node("rB2", status="running")
     add_log("18:39 P2: Loop B — NEW people: 15 bios (Dario Amodei, 王海峰, Charity Majors...)")
     wait_tick(0.6)
     burn_tokens("rB2", 2, (3000, 5000), 0.8)
-    update_node("rB2", status="done")
+    complete_node("rB2")
     add_log("P2 Loop B ✅ 15 bios filled")
 
     update_node("rC2", status="running")
     add_log("18:40 P2: Loop C — NEW readings: Chase/Moura/Chi Wang/Qingyun Wu latest")
     wait_tick(0.5)
     burn_tokens("rC2", 2, (2000, 4000), 0.7)
-    update_node("rC2", status="done")
+    complete_node("rC2")
     add_log("P2 Loop C ✅ 4 articles confirmed")
 
-    STATE["loop_state"]["done"] = 7
     add_log("18:41 DIMINISHING: Pass 2 is detail-fill only — 0 new cross-ref entries → STOP")
     add_log("Budget: 2/4 passes · ~130/200 Brave · ~12min/2h")
     wait_tick(0.4)
@@ -341,19 +583,76 @@ def simulate_loop():
     wait_tick(0.5)
     burn_tokens("ver", 1, (2000, 3000), 0.5)
     add_log("Verifier ✅ 15 verified · 7 minor · 3 WRONG (fixed) · 5 unverified")
-    update_node("ver", status="done")
-    STATE["loop_state"]["done"] = 8
+    complete_node("ver")
     wait_tick(0.4)
 
     # ══════════════ FINAL ══════════════
-    STATE["loop_state"]["done"] = 10
-    STATE["loop_state"]["summary"] = (
+    total_tokens, total_cost = metrics_snapshot()
+    update_loop_state(summary=(
         f"Groundweave complete: 27 Glossary · 18 Key People · 31 Reading List. "
         f"2 reinforce passes, diminishing at P2. 3 verifier errors fixed. "
-        f"~130 Brave queries. Total: {STATE['total_tokens']:,} tokens, ${STATE['total_cost']:.4f}"
-    )
+        f"~130 Brave queries. Total: {total_tokens:,} tokens, ${total_cost:.4f}"
+    ))
     add_log("18:55 🎯 DELIVERY: glossary-v2.md + key-people-v2.md + reading-list-v2.md")
     add_log("Project: multi-agent-research/")
+    broadcast()
+
+
+def run_simulation(context):
+    global _active_context
+    _thread_context.run = context
+    try:
+        simulate_loop(context)
+    except RunCancelled:
+        pass
+    finally:
+        with STATE_LOCK:
+            if _active_context is context:
+                CONTROL["running"] = False
+                CONTROL["paused"] = False
+                _active_context = None
+        _thread_context.run = None
+
+
+def restart_simulation():
+    global _active_context, _run_generation
+    with _run_lifecycle_lock:
+        with STATE_LOCK:
+            old_context = _active_context
+            if old_context is not None:
+                old_context.cancel.set()
+            _run_generation += 1
+            context = RunContext(_run_generation)
+            _active_context = context
+            CONTROL["running"] = True
+            CONTROL["paused"] = False
+            old_thread = old_context.thread if old_context is not None else None
+
+        if old_thread is not None and old_thread is not threading.current_thread():
+            old_thread.join()
+
+        thread = threading.Thread(
+            target=run_simulation,
+            args=(context,),
+            name=f"simulate-loop-{context.generation}",
+            daemon=True,
+        )
+        context.thread = thread
+        thread.start()
+    return context.generation
+
+
+def stop_simulation():
+    with _run_lifecycle_lock:
+        with STATE_LOCK:
+            context = _active_context
+            if context is not None:
+                context.cancel.set()
+            thread = context.thread if context is not None else None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -478,7 +777,7 @@ svg{width:100%;height:auto;max-width:900px}
 const NODE_R = 8, NODE_W = 195, NODE_H = 64;
 const COLORS = {pending:'#eaeef2',queued:'#fff3cd',running:'#fff8e1',done:'#dafbe1',blocked:'#ffd8d8',warning:'#ffe8cc'};
 let paused = false, speed = 1;
-const BASE = '/temp0717';
+const BASE = '__PATH_PREFIX__';
 
 function render(state){
   const gi = document.getElementById('goal-input');
@@ -489,7 +788,7 @@ function render(state){
   const pct = (state.loop_state.done / state.loop_state.total) * 100;
   document.getElementById('progress-fill').style.width = pct+'%';
   const svg = document.getElementById('svg');
-  svg.innerHTML = '';
+  svg.replaceChildren();
   const ns = 'http://www.w3.org/2000/svg';
   state.edges.forEach(e => {
     const f = state.nodes.find(n=>n.id===e.from), t = state.nodes.find(n=>n.id===e.to);
@@ -569,7 +868,7 @@ function render(state){
     svg.appendChild(g);
   });
   const logsEl = document.getElementById('logs');
-  logsEl.innerHTML = '';
+  logsEl.replaceChildren();
   state.logs.forEach(l => {
     const div = document.createElement('div');
     div.className = 'log-line fade-in';
@@ -580,12 +879,24 @@ function render(state){
   });
   logsEl.scrollTop = logsEl.scrollHeight;
   const ls = document.getElementById('ls-content');
-  ls.innerHTML = `<div class="ls-item">Done: ${state.loop_state.done}/${state.loop_state.total}</div>`;
+  ls.replaceChildren();
+  const doneItem = document.createElement('div');
+  doneItem.className = 'ls-item';
+  doneItem.textContent = `Done: ${state.loop_state.done}/${state.loop_state.total}`;
+  ls.appendChild(doneItem);
   state.loop_state.blocked.forEach(b => {
-    ls.innerHTML += `<div class="ls-item ls-blocked">\u26a0 ${b}</div>`;
+    const blocked = document.createElement('div');
+    blocked.className = 'ls-item ls-blocked';
+    blocked.textContent = `\u26a0 ${b}`;
+    ls.appendChild(blocked);
   });
   if(state.loop_state.summary){
-    ls.innerHTML += `<div class="ls-item" style="margin-top:4px;color:#8b949e">${state.loop_state.summary}</div>`;
+    const summary = document.createElement('div');
+    summary.className = 'ls-item';
+    summary.style.marginTop = '4px';
+    summary.style.color = '#8b949e';
+    summary.textContent = state.loop_state.summary;
+    ls.appendChild(summary);
   }
 }
 
@@ -639,9 +950,27 @@ function showDetail(n){
   const d = document.getElementById('node-detail');
   const c = document.getElementById('detail-content');
   const colors = {pending:'\u23f3',queued:'\U0001f4cb',running:'\U0001f7e2',done:'\u2705',blocked:'\U0001f534',warning:'\u26a0\ufe0f'};
-  c.innerHTML = `<h3>${colors[n.status]||''} ${n.label}</h3>
-    <p><b>Task:</b> ${n.task}</p>
-    <p><b>Tokens:</b> ${fmtNum(n.tokens)} \u00b7 <b>Status:</b> ${n.status}</p>`;
+  c.replaceChildren();
+  const heading = document.createElement('h3');
+  heading.textContent = `${colors[n.status]||''} ${n.label}`;
+  c.appendChild(heading);
+  const task = document.createElement('p');
+  const taskLabel = document.createElement('b');
+  taskLabel.textContent = 'Task:';
+  task.append(taskLabel, document.createTextNode(` ${n.task}`));
+  c.appendChild(task);
+  const metrics = document.createElement('p');
+  const tokensLabel = document.createElement('b');
+  tokensLabel.textContent = 'Tokens:';
+  const statusLabel = document.createElement('b');
+  statusLabel.textContent = 'Status:';
+  metrics.append(
+    tokensLabel,
+    document.createTextNode(` ${fmtNum(n.tokens)} \u00b7 `),
+    statusLabel,
+    document.createTextNode(` ${n.status}`),
+  );
+  c.appendChild(metrics);
   d.classList.remove('hidden');
 }
 function closeDetail(){
@@ -670,90 +999,208 @@ document.getElementById('canvas-panel').addEventListener('click', e => {
 </html>"""
 
 
+class RequestError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(REQUEST_TIMEOUT)
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError):
+            pass
+
+    def _send_json(self, status, payload):
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        if status >= 400:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(data)
+        self.wfile.flush()
+
+    def _send_html(self, html):
+        data = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        self.wfile.flush()
+
+    @staticmethod
+    def _html_for_base(base):
+        return HTML.replace(
+            "const BASE = '__PATH_PREFIX__';",
+            f"const BASE = {json.dumps(base)};",
+        )
+
+    def _read_json_body(self):
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise RequestError(400, "Content-Length is required")
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            raise RequestError(400, "invalid Content-Length")
+        if length < 0:
+            raise RequestError(400, "invalid Content-Length")
+        if length > MAX_CONTENT_LENGTH:
+            raise RequestError(413, "request body is too large")
+        try:
+            raw_body = self.rfile.read(length)
+        except socket.timeout:
+            raise RequestError(408, "request timed out")
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise RequestError(400, "invalid JSON")
+        if body is None:
+            raise RequestError(400, "JSON body must not be null")
+        if not isinstance(body, dict):
+            raise RequestError(400, "JSON body must be an object")
+        return body
+
+    def _last_event_id(self):
+        value = self.headers.get("Last-Event-ID")
+        if value is None:
+            return None
+        try:
+            event_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        return event_id if 0 <= event_id <= 2**63 - 1 else None
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            html = HTML.replace("const BASE = '/temp0717';", "const BASE = '';")
-            self.wfile.write(html.encode())
-        elif path in ("/temp0717/",):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(HTML.encode())
-        elif path == "/temp0717":
+            self._send_html(self._html_for_base(""))
+        elif PATH_PREFIX and path == PATH_PREFIX + "/":
+            self._send_html(self._html_for_base(PATH_PREFIX))
+        elif PATH_PREFIX and path == PATH_PREFIX:
             self.send_response(301)
-            self.send_header("Location", "/temp0717/")
+            self.send_header("Location", PATH_PREFIX + "/")
+            self.send_header("Content-Length", "0")
             self.end_headers()
-        elif path == "/stream" or path == "/temp0717/stream":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            q = __import__("queue").Queue()
-            SSE_CLIENTS.append(q)
-            try:
-                self.wfile.write(f"data: {json.dumps(STATE)}\n\n".encode())
-                self.wfile.flush()
-                while True:
-                    data = q.get()
-                    if data is None:
-                        break
-                    self.wfile.write(f"data: {data}\n\n".encode())
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                if q in SSE_CLIENTS:
-                    SSE_CLIENTS.remove(q)
+        elif path == "/stream" or (PATH_PREFIX and path == PATH_PREFIX + "/stream"):
+            self._serve_sse()
         else:
-            self.send_response(404)
+            self._send_json(404, {"ok": False, "error": "not found"})
+
+    def _serve_sse(self):
+        client_queue = queue.Queue(maxsize=1)
+        if not add_sse_client(client_queue):
+            self._send_json(503, {"ok": False, "error": "SSE client limit reached"})
+            return
+        try:
+            initial = current_sse_snapshot(self._last_event_id())
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
+            self.connection.settimeout(SSE_WRITE_TIMEOUT)
+            self.wfile.write(initial.encode("utf-8"))
+            self.wfile.flush()
+            while True:
+                try:
+                    payload = client_queue.get(timeout=SSE_HEARTBEAT_INTERVAL)
+                except queue.Empty:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    continue
+                self.wfile.write(payload.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, TimeoutError, OSError):
+            pass
+        finally:
+            remove_sse_client(client_queue)
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path in ("/control", "/temp0717/control"):
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
-            action = body.get("action", "")
-            if action == "pause":
-                CONTROL["paused"] = True
-            elif action == "resume":
-                CONTROL["paused"] = False
-            elif action == "toggle":
-                CONTROL["paused"] = not CONTROL["paused"]
-            elif action == "speed":
-                CONTROL["speed"] = float(body.get("speed", 1.0))
-            elif action == "restart":
-                CONTROL["running"] = False
-                time.sleep(0.3)
-                t = threading.Thread(target=simulate_loop, daemon=True)
-                t.start()
-            elif action == "goal":
-                STATE["goal"] = body.get("goal", STATE["goal"])
-                broadcast()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": True, "paused": CONTROL["paused"], "speed": CONTROL["speed"]}).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+        if path != "/control" and not (PATH_PREFIX and path == PATH_PREFIX + "/control"):
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
 
-    def log_message(self, *a):
+        try:
+            body = self._read_json_body()
+        except RequestError as error:
+            self._send_json(error.status, {"ok": False, "error": error.message})
+            return
+
+        action = body.get("action")
+        allowed_actions = {"pause", "resume", "toggle", "speed", "restart", "goal"}
+        if not isinstance(action, str) or action not in allowed_actions:
+            self._send_json(400, {"ok": False, "error": "unknown action"})
+            return
+
+        if action == "speed":
+            speed = body.get("speed")
+            try:
+                speed_value = (
+                    float(speed)
+                    if not isinstance(speed, bool) and isinstance(speed, (int, float))
+                    else None
+                )
+            except (OverflowError, TypeError, ValueError):
+                speed_value = None
+            if speed_value is None or not math.isfinite(speed_value) or speed_value <= 0:
+                self._send_json(400, {"ok": False, "error": "speed must be a finite number greater than 0"})
+                return
+            set_speed(speed_value)
+        elif action == "pause":
+            set_paused(True)
+        elif action == "resume":
+            set_paused(False)
+        elif action == "toggle":
+            toggle_paused()
+        elif action == "restart":
+            restart_simulation()
+        elif action == "goal":
+            goal = body.get("goal")
+            if not isinstance(goal, str) or len(goal) > 1000:
+                self._send_json(400, {"ok": False, "error": "goal must be a string of at most 1000 characters"})
+                return
+            with STATE_LOCK:
+                STATE["goal"] = goal
+            broadcast()
+
+        with STATE_LOCK:
+            response = {
+                "ok": True,
+                "paused": CONTROL["paused"],
+                "speed": CONTROL["speed"],
+                "running": CONTROL["running"],
+            }
+        self._send_json(200, response)
+
+    def log_message(self, *args):
+        pass
+
+    def log_error(self, *args):
         pass
 
 
 if __name__ == "__main__":
-    print(f"Agent Loop Visualizer → http://localhost:{PORT}")
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    public_path = PATH_PREFIX or "/"
+    print(f"Agent Loop Visualizer → http://127.0.0.1:{PORT}{public_path}")
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        stop_simulation()
         server.shutdown()

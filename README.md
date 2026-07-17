@@ -10,10 +10,15 @@ Renders a live flowchart showing agent loop topology — orchestrator → worker
 
 ```bash
 python3 server.py 8767
-# → http://localhost:8767
+# → http://127.0.0.1:8767
 ```
 
-Optionally serve behind a reverse proxy (nginx, cloudflared) with a custom path prefix.
+Optionally serve behind a reverse proxy (nginx, cloudflared) with a custom path prefix:
+
+```bash
+AGENT_VIZ_PATH_PREFIX=/research python3 server.py 8767
+# → http://127.0.0.1:8767/research/
+```
 
 ## Features
 
