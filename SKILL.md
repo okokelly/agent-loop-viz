@@ -44,10 +44,10 @@ Each node on the canvas shows: role label, task description, live token counter,
 
 ## Quick Start
 
-Template: `~/amber-os/_Services/agent-viz/server.py`
+Template: `~/agent-loop-viz/server.py`
 
 ```bash
-cd ~/amber-os/_Services/agent-viz
+cd ~/agent-loop-viz
 python3 server.py 8767
 # → http://localhost:8767
 ```
@@ -199,7 +199,7 @@ body{overflow:hidden} /* prevents whole-page scroll on mobile */
 - **Port conflicts**: `lsof -ti:PORT | xargs kill -9` before restart. Especially when a previous server instance didn't fully exit.
 - **Port 8766 reserved**: A legacy Python process on Kelly's machine keeps port 8766 occupied (recall webhook). Use 8767+ for new services.
 - **Simulation ≠ execution**: The template simulates token counts with `random`. Real integration requires reading actual token usage from `delegate_task` results.
-- **Default server.py is NOT generic**: The deployed template at `~/amber-os/_Services/agent-viz/server.py` is hardcoded to a specific GSB research project — node topology, labels, goal text, and task descriptions are all GSB-specific. Running `python3 server.py` as-is shows GSB content no matter what project you're working on. For a new project, you MUST rewrite STATE['goal'], STATE['loop_state'], STATE['nodes'] (topology + labels + tasks), and STATE['edges'] before the viz is meaningful. This is a template to be adapted, not a plug-and-play generic viz.
+- **Default server.py is NOT generic**: The deployed template at `~/agent-loop-viz/server.py` is hardcoded to a specific GSB research project — node topology, labels, goal text, and task descriptions are all GSB-specific. Running `python3 server.py` as-is shows GSB content no matter what project you're working on. For a new project, you MUST rewrite STATE['goal'], STATE['loop_state'], STATE['nodes'] (topology + labels + tasks), and STATE['edges'] before the viz is meaningful. This is a template to be adapted, not a plug-and-play generic viz.
 - **SSE reconnect**: Frontend auto-reconnects via `EventSource`, but if the server restarts mid-simulation, the state resets.
 - **No persistence**: The dashboard is ephemeral — refresh loses state. For durable visualization, the real executor should write state to a file that the server reads on startup.
 - **Single-file constraint**: All HTML/CSS/JS is embedded as a Python string. This is deliberate for zero-dependency deployment but makes the file long (~400 lines). Edit with care — the HTML string uses `r"""..."""` raw strings.
