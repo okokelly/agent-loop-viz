@@ -95,7 +95,7 @@ pending=#3a3a4a, queued=#8b7a2e, running=#2e8b57 (pulsing), done=#3a6b8b, blocke
 When building a new viz server, default to light mode with the light color palette. The user prefers light backgrounds with GitHub-style color scheme (#f6f8fa background, #fff white cards, #0969da blue accents).
 
 Edge colors in light mode: running=#e6c300 (pulsing yellow), done=#a8e6cf (green), pending=#d0d7de (gray border).
-Node fill: status color directly (e.g., done nodes are filled #dafbe1 green, running nodes are filled #fff8e1 yellow). Border is subtle #d0d7de. User explicitly prefers colored fills over just-colored borders ("不是边是那个shape").
+Node fill: status color directly (e.g., done nodes are filled green, running nodes are filled yellow). Border is subtle #d0d7de for contrast.
 Node text: #1f2328 for labels, #656d76 for descriptions.
 Edge label background: #f6f8fa.
 
