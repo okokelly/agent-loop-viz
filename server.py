@@ -15,7 +15,7 @@ import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -27,11 +27,39 @@ except (TypeError, ValueError):
 if not 1 <= PORT <= 65535:
     raise SystemExit("PORT must be between 1 and 65535")
 
+
+def topology_path_from_args(args):
+    topology_path = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--topology":
+            index += 1
+            if index >= len(args) or args[index].startswith("--"):
+                raise SystemExit("--topology requires a JSON file path")
+            topology_path = args[index]
+        elif arg.startswith("--topology="):
+            topology_path = arg.split("=", 1)[1]
+            if not topology_path:
+                raise SystemExit("--topology requires a JSON file path")
+        else:
+            raise SystemExit(f"unknown argument: {arg}")
+        index += 1
+    return topology_path
+
+
+TOPOLOGY_PATH = topology_path_from_args(sys.argv[2:]) or os.environ.get(
+    "AGENT_VIZ_TOPOLOGY"
+)
+TOPOLOGY_SOURCE = "built-in GSB default"
+
 MAX_CONTENT_LENGTH = 64 * 1024
 MAX_SSE_CLIENTS = 32
 REQUEST_TIMEOUT = 10
 SSE_HEARTBEAT_INTERVAL = 15
 SSE_WRITE_TIMEOUT = 10
+STATE_FILE = os.path.join(os.getcwd(), "agent-viz-state.json")
+STATE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def normalize_path_prefix(value):
@@ -48,6 +76,7 @@ PATH_PREFIX = normalize_path_prefix(os.environ.get("AGENT_VIZ_PATH_PREFIX", ""))
 # Budget: 4 passes max, 200 Brave queries, 2h wall-clock
 STATE = {
     "goal": "Groundweave: Multi-Agent Architecture & Stack Research (7 dims)",
+    "viewBox": "0 0 900 685",
     "elapsed": 0,
     "total_tokens": 0,
     "total_cost": 0.0,
@@ -107,10 +136,51 @@ STATE = {
     "logs": [],
 }
 
+
+def load_topology(path):
+    try:
+        with open(path, "r", encoding="utf-8") as topology_file:
+            topology = json.load(topology_file)
+    except FileNotFoundError:
+        raise SystemExit(f"topology file not found: {path}")
+    except OSError as error:
+        raise SystemExit(f"could not read topology file {path}: {error}")
+    except json.JSONDecodeError as error:
+        raise SystemExit(
+            f"invalid topology JSON in {path} at line {error.lineno}, "
+            f"column {error.colno}: {error.msg}"
+        )
+
+    if not isinstance(topology, dict):
+        raise SystemExit(f"invalid topology in {path}: root must be a JSON object")
+    required = {"nodes": list, "edges": list, "goal": str}
+    for key, expected_type in required.items():
+        if key not in topology:
+            raise SystemExit(f"invalid topology in {path}: missing '{key}'")
+        if not isinstance(topology[key], expected_type):
+            raise SystemExit(
+                f"invalid topology in {path}: '{key}' must be "
+                f"{expected_type.__name__}"
+            )
+    if "viewBox" in topology and not isinstance(topology["viewBox"], (str, list)):
+        raise SystemExit(
+            f"invalid topology in {path}: 'viewBox' must be a string or list"
+        )
+
+    STATE.update(
+        {key: copy.deepcopy(topology[key]) for key in ("nodes", "edges", "goal", "viewBox")
+         if key in topology}
+    )
+
+
+if TOPOLOGY_PATH:
+    load_topology(TOPOLOGY_PATH)
+    TOPOLOGY_SOURCE = os.path.abspath(TOPOLOGY_PATH)
+
 STATE_LOCK = threading.RLock()
+PERSISTENCE_LOCK = threading.Lock()
 SSE_CLIENTS = []
 CONTROL = {"paused": False, "speed": 1.0, "running": False}
-NODE_COUNT = len(STATE["nodes"])
 
 
 class RunCancelled(Exception):
@@ -187,6 +257,44 @@ def _sse_payload(snapshot, event_id):
     return f"id: {event_id}\ndata: {data}\n\n"
 
 
+def persist_state(snapshot):
+    temporary_path = STATE_FILE + ".tmp"
+    try:
+        with PERSISTENCE_LOCK:
+            with open(temporary_path, "w", encoding="utf-8") as state_file:
+                json.dump(snapshot, state_file, ensure_ascii=False, indent=2)
+                state_file.write("\n")
+            os.replace(temporary_path, STATE_FILE)
+    except OSError as error:
+        print(f"Warning: could not persist state: {error}", file=sys.stderr)
+
+
+def load_persisted_state():
+    try:
+        age = time.time() - os.path.getmtime(STATE_FILE)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        print(f"Warning: could not inspect persisted state: {error}", file=sys.stderr)
+        return False
+    if age >= STATE_MAX_AGE_SECONDS:
+        return False
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as state_file:
+            persisted = json.load(state_file)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Warning: could not load persisted state: {error}", file=sys.stderr)
+        return False
+    if not isinstance(persisted, dict):
+        print("Warning: persisted state must be a JSON object", file=sys.stderr)
+        return False
+
+    with STATE_LOCK:
+        STATE.update(copy.deepcopy(persisted))
+    return True
+
+
 def broadcast():
     global _sse_event_id
     with STATE_LOCK:
@@ -194,6 +302,7 @@ def broadcast():
         _sse_event_id += 1
         event_id = _sse_event_id
         clients = tuple(SSE_CLIENTS)
+    persist_state(snapshot)
     payload = _sse_payload(snapshot, event_id)
     dead = []
     for client_queue in clients:
@@ -302,49 +411,55 @@ def wait_tick(s, context=None):
     broadcast()
 
 
-def update_node(nid, **kwargs):
+def update_node(nid, _bypass_context=False, **kwargs):
     context = current_context()
-    ensure_current(context)
+    if not _bypass_context:
+        ensure_current(context)
     with STATE_LOCK:
-        if not _is_current_locked(context):
+        if not _bypass_context and not _is_current_locked(context):
             raise RunCancelled
         for n in STATE["nodes"]:
             if n["id"] == nid:
                 n.update(kwargs)
-                return
+                return True
+    return False
 
 
-def complete_node(nid):
+def complete_node(nid, _bypass_context=False):
     context = current_context()
-    ensure_current(context)
+    if not _bypass_context:
+        ensure_current(context)
     with STATE_LOCK:
-        if not _is_current_locked(context):
+        if not _bypass_context and not _is_current_locked(context):
             raise RunCancelled
         for n in STATE["nodes"]:
             if n["id"] == nid:
                 if n["status"] != "done":
                     n["status"] = "done"
                     STATE["loop_state"]["done"] += 1
-                return
+                return True
+    return False
 
 
-def add_log(msg: str):
+def add_log(msg: str, _bypass_context=False):
     context = current_context()
-    ensure_current(context)
+    if not _bypass_context:
+        ensure_current(context)
     t = time.strftime("%H:%M:%S")
     with STATE_LOCK:
-        if not _is_current_locked(context):
+        if not _bypass_context and not _is_current_locked(context):
             raise RunCancelled
         STATE["logs"].append(f"[{t}] {msg}")
         if len(STATE["logs"]) > 14:
             STATE["logs"] = STATE["logs"][-14:]
 
 
-def update_loop_state(**kwargs):
+def update_loop_state(_bypass_context=False, **kwargs):
     context = current_context()
-    ensure_current(context)
+    if not _bypass_context:
+        ensure_current(context)
     with STATE_LOCK:
-        if not _is_current_locked(context):
+        if not _bypass_context and not _is_current_locked(context):
             raise RunCancelled
         STATE["loop_state"].update(kwargs)
 
@@ -376,16 +491,17 @@ def burn_tokens(nid, tick_count, tok_range, delay=0.6):
         wait_tick(delay, context)
 
 
-def reset_state(context):
-    ensure_current(context)
+def reset_state(context=None, _bypass_context=False):
+    if not _bypass_context:
+        ensure_current(context)
     with STATE_LOCK:
-        if not _is_current_locked(context):
+        if not _bypass_context and not _is_current_locked(context):
             raise RunCancelled
         STATE["elapsed"] = 0
         STATE["total_tokens"] = 0
         STATE["total_cost"] = 0.0
         STATE["loop_state"] = {
-            "done": 0, "total": NODE_COUNT, "blocked": [], "summary": "",
+            "done": 0, "total": len(STATE["nodes"]), "blocked": [], "summary": "",
             "passes": 0, "new_glossary": 0, "new_people": 0, "new_reading": 0,
         }
         for n in STATE["nodes"]:
@@ -660,59 +776,67 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent Loop Visualizer</title>
 <style>
+:root { --bg: #f6f8fa; --card: #fff; --text: #1f2328; --border: #d0d7de; --accent: #0969da; --muted: #656d76; --danger: #cf222e; --success: #1a7f37; --success-border: #2da44e; --success-bg: #dafbe1; --hover: #eaeef2; --canvas-center: #fff; --overlay: rgba(246,248,250,.92); --shadow-sm: rgba(0,0,0,.06); --shadow-side: rgba(0,0,0,.04); --shadow-lg: rgba(0,0,0,.12); --success-glow: rgba(45,164,78,.3); }
+[data-theme="dark"] { --bg: #0d1117; --card: #161b22; --text: #c9d1d9; --border: #30363d; --accent: #58a6ff; --muted: #8b949e; --danger: #ff7b72; --success: #3fb950; --success-border: #238636; --success-bg: #173b24; --hover: #21262d; --canvas-center: #161b22; --overlay: rgba(13,17,23,.92); --shadow-sm: rgba(0,0,0,.35); --shadow-side: rgba(0,0,0,.3); --shadow-lg: rgba(0,0,0,.45); --success-glow: rgba(63,185,80,.3); }
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#f6f8fa;color:#1f2328;font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
-header{background:#fff;border-bottom:1px solid #d0d7de;padding:10px 14px;display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap;min-height:44px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-header h1{font-size:15px;font-weight:600;color:#0969da;white-space:nowrap}
-.goal{font-size:12px;color:#656d76;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+header{background:var(--card);border-bottom:1px solid var(--border);padding:10px 14px;display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap;min-height:44px;box-shadow:0 1px 3px var(--shadow-sm)}
+header h1{font-size:15px;font-weight:600;color:var(--accent);white-space:nowrap}
+.goal{font-size:12px;color:var(--muted);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stats{display:flex;gap:12px;font-size:11px;font-family:'SF Mono',monospace}
-.stat-val{color:#0969da;font-weight:600}
-.live-clock{color:#cf222e;font-variant-numeric:tabular-nums}
+.stat-val{color:var(--accent);font-weight:600}
+.live-clock{color:var(--danger);font-variant-numeric:tabular-nums}
+#theme-toggle{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;cursor:pointer;font-size:14px;min-height:32px;min-width:34px;transition:background .2s}
+#theme-toggle:hover{background:var(--hover)}
 #main{flex:1;display:flex;overflow:hidden;position:relative}
-#canvas-panel{flex:1;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at center,#fff 0%,#f6f8fa 70%);overflow:auto;padding:12px;position:relative}
+#canvas-panel{flex:1;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at center,var(--canvas-center) 0%,var(--bg) 70%);overflow:hidden;padding:12px;position:relative;touch-action:none;cursor:grab}
+#canvas-panel.panning{cursor:grabbing}
 svg{width:100%;height:auto;max-width:900px}
-#start-overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(246,248,250,.92);z-index:20;transition:opacity .4s ease;gap:16px}
+#reset-view{position:absolute;top:12px;right:12px;z-index:30;background:var(--card);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;font-size:12px;box-shadow:0 1px 3px var(--shadow-sm)}
+#reset-view:hover{background:var(--hover)}
+#reset-view.hidden{display:none}
+#start-overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--overlay);z-index:20;transition:opacity .4s ease;gap:16px}
 #start-overlay.hidden{opacity:0;pointer-events:none}
-#btn-start{font-size:24px;padding:16px 48px;border:2px solid #2da44e;background:#dafbe1;color:#1a7f37;border-radius:8px;cursor:pointer;font-weight:600;letter-spacing:.05em;transition:transform .2s,box-shadow .2s}
-#btn-start:hover{transform:scale(1.05);box-shadow:0 0 24px rgba(45,164,78,.3)}
-#start-overlay p{color:#656d76;font-size:13px}
+#btn-start{font-size:24px;padding:16px 48px;border:2px solid var(--success-border);background:var(--success-bg);color:var(--success);border-radius:8px;cursor:pointer;font-weight:600;letter-spacing:.05em;transition:transform .2s,box-shadow .2s}
+#btn-start:hover{transform:scale(1.05);box-shadow:0 0 24px var(--success-glow)}
+#start-overlay p{color:var(--muted);font-size:13px}
 #controls.hidden{display:none}
-#side-panel{width:340px;background:#fff;border-left:1px solid #d0d7de;display:flex;flex-direction:column;flex-shrink:0;transition:width .3s ease,opacity .3s ease,transform .3s ease;overflow:hidden;z-index:10;box-shadow:-2px 0 8px rgba(0,0,0,.04)}
+#side-panel{width:340px;background:var(--card);border-left:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;transition:width .3s ease,opacity .3s ease,transform .3s ease;overflow:hidden;z-index:10;box-shadow:-2px 0 8px var(--shadow-side)}
 #side-panel.collapsed{width:0;border-left:none;opacity:0}
-#side-panel h2{font-size:13px;font-weight:600;color:#656d76;padding:12px 16px;border-bottom:1px solid #d0d7de;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+#side-panel h2{font-size:13px;font-weight:600;color:var(--muted);padding:12px 16px;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
 #logs{flex:1;overflow-y:auto;padding:8px;overscroll-behavior:contain}
-.log-line{font-size:12px;color:#656d76;padding:4px 8px;font-family:'SF Mono',monospace;line-height:1.6;word-break:break-all}
-.log-line.bl{color:#cf222e}
-.log-line.ok{color:#1a7f37}
-#loop-state{padding:12px 16px;border-top:1px solid #d0d7de;font-size:12px}
-#loop-state .ls-title{color:#656d76;font-weight:600;margin-bottom:6px}
-#loop-state .ls-item{color:#1f2328;padding:2px 0;word-break:break-all}
-#loop-state .ls-blocked{color:#cf222e}
-#toggle-log{background:#f6f8fa;border:1px solid #d0d7de;color:#656d76;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;transition:background .2s;min-height:32px;min-width:32px}
-#toggle-log:hover{background:#eaeef2;color:#1f2328}
-#toggle-log.active{background:#dafbe1;border-color:#2da44e;color:#1a7f37}
+.log-line{font-size:12px;color:var(--muted);padding:4px 8px;font-family:'SF Mono',monospace;line-height:1.6;word-break:break-all}
+.log-line.bl{color:var(--danger)}
+.log-line.ok{color:var(--success)}
+#loop-state{padding:12px 16px;border-top:1px solid var(--border);font-size:12px}
+#loop-state .ls-title{color:var(--muted);font-weight:600;margin-bottom:6px}
+#loop-state .ls-item{color:var(--text);padding:2px 0;word-break:break-all}
+#loop-state .ls-blocked{color:var(--danger)}
+#toggle-log{background:var(--bg);border:1px solid var(--border);color:var(--muted);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;transition:background .2s;min-height:32px;min-width:32px}
+#toggle-log:hover{background:var(--hover);color:var(--text)}
+#toggle-log.active{background:var(--success-bg);border-color:var(--success-border);color:var(--success)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .pulse{animation:pulse 1.2s ease-in-out infinite}
 .fade-in{animation:fadeIn .4s ease-out}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-#controls{display:flex;align-items:center;gap:6px;padding:6px 12px;background:#fff;border-bottom:1px solid #d0d7de;flex-shrink:0;min-height:36px}
-#controls button{background:#f6f8fa;border:1px solid #d0d7de;color:#1f2328;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;min-width:28px;transition:background .2s}
-#controls button:hover{background:#eaeef2}
-#controls button.on{background:#dafbe1;border-color:#2da44e;color:#1a7f37}
+#controls{display:flex;align-items:center;gap:6px;padding:6px 12px;background:var(--card);border-bottom:1px solid var(--border);flex-shrink:0;min-height:36px}
+#controls button{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;min-width:28px;transition:background .2s}
+#controls button:hover{background:var(--hover)}
+#controls button.on{background:var(--success-bg);border-color:var(--success-border);color:var(--success)}
 #speed-btns{display:flex;gap:2px}
 #speed-btns button{min-width:32px;font-size:11px}
-#speed-btns button.sel{background:#dafbe1;border-color:#2da44e;color:#1a7f37}
+#speed-btns button.sel{background:var(--success-bg);border-color:var(--success-border);color:var(--success)}
 #progress-wrap{flex:1;margin:0 8px}
-#progress-bar{height:4px;background:#d0d7de;border-radius:2px;overflow:hidden}
-#progress-fill{height:100%;width:0;background:#2da44e;transition:width .3s ease;border-radius:2px}
-.goal-input{flex:1;min-width:0;background:transparent;border:none;color:#1f2328;font-size:12px;padding:2px 4px;outline:none;font-family:inherit}
-.goal-input:focus{background:#f6f8fa}
-#node-detail{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:16px 20px;z-index:100;min-width:300px;max-width:500px;box-shadow:0 4px 24px rgba(0,0,0,.12);transition:opacity .2s ease,transform .2s ease}
+#progress-bar{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
+#progress-fill{height:100%;width:0;background:var(--success-border);transition:width .3s ease;border-radius:2px}
+.goal-input{flex:1;min-width:0;background:transparent;border:none;color:var(--text);font-size:12px;padding:2px 4px;outline:none;font-family:inherit}
+.goal-input:focus{background:var(--bg)}
+#node-detail{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px 20px;z-index:100;min-width:300px;max-width:500px;box-shadow:0 4px 24px var(--shadow-lg);transition:opacity .2s ease,transform .2s ease}
 #node-detail.hidden{opacity:0;transform:translateX(-50%) translateY(10px);pointer-events:none}
-#detail-close{position:absolute;top:8px;right:12px;cursor:pointer;color:#656d76;font-size:16px}
-#detail-close:hover{color:#cf222e}
-#detail-content h3{color:#0969da;font-size:14px;margin-bottom:4px}
-#detail-content p{color:#656d76;font-size:12px;margin:2px 0}
+#detail-close{position:absolute;top:8px;right:12px;cursor:pointer;color:var(--muted);font-size:16px}
+#detail-close:hover{color:var(--danger)}
+#detail-content h3{color:var(--accent);font-size:14px;margin-bottom:4px}
+#detail-content p{color:var(--muted);font-size:12px;margin:2px 0}
 @media (max-width: 768px){
   body{overflow:hidden}
   header{padding:8px 12px;gap:8px;min-height:40px}
@@ -741,6 +865,7 @@ svg{width:100%;height:auto;max-width:900px}
     <span>🔥 <span class="stat-val" id="tokens">0</span></span>
     <span>💰 <span class="stat-val" id="cost">$0</span></span>
   </div>
+  <button id="theme-toggle" onclick="toggleTheme()" title="Switch to dark theme" aria-label="Switch color theme">🌙</button>
 </header>
 <div id="controls" class="hidden">
   <button id="btn-play" onclick="togglePlay()" title="Play/Pause">⏸</button>
@@ -755,6 +880,7 @@ svg{width:100%;height:auto;max-width:900px}
 <div id="main">
   <div id="canvas-panel">
     <svg id="svg" viewBox="0 0 900 685" preserveAspectRatio="xMidYMid meet"></svg>
+    <button id="reset-view" class="hidden" onclick="resetView()">Reset view</button>
     <div id="start-overlay">
       <button id="btn-start" onclick="doStart()">▶ Start</button>
       <p>Groundweave: Multi-Agent Architecture Research</p>
@@ -775,11 +901,86 @@ svg{width:100%;height:auto;max-width:900px}
 </div>
 <script>
 const NODE_R = 8, NODE_W = 195, NODE_H = 64;
-const COLORS = {pending:'#eaeef2',queued:'#fff3cd',running:'#fff8e1',done:'#dafbe1',blocked:'#ffd8d8',warning:'#ffe8cc'};
+const COLOR_THEMES = {
+  light: {
+    nodes: {pending:'#eaeef2',queued:'#fff3cd',running:'#fff8e1',done:'#dafbe1',blocked:'#ffd8d8',warning:'#ffe8cc'},
+    dots: {pending:'#8b949e',queued:'#d4a017',running:'#e6c300',done:'#2da44e',blocked:'#cf222e',warning:'#e67e00'},
+    edge:'#d0d7de', edgeRunning:'#e6c300', edgeDone:'#a8e6cf', labelBg:'#f6f8fa',
+    text:'#1f2328', muted:'#656d76', accent:'#0969da', badge:'#8b2e2e', badgeText:'#fff',
+  },
+  dark: {
+    nodes: {pending:'#21262d',queued:'#3b2f12',running:'#3f3410',done:'#173b24',blocked:'#4c1f24',warning:'#462f13'},
+    dots: {pending:'#8b949e',queued:'#d29922',running:'#e3b341',done:'#3fb950',blocked:'#ff7b72',warning:'#d29922'},
+    edge:'#30363d', edgeRunning:'#d29922', edgeDone:'#238636', labelBg:'#0d1117',
+    text:'#c9d1d9', muted:'#8b949e', accent:'#58a6ff', badge:'#6e3035', badgeText:'#f0f6fc',
+  },
+};
+let COLORS = COLOR_THEMES.light;
+let lastState = null;
 let paused = false, speed = 1;
+let zoom = 1, panX = 0, panY = 0;
+let baseViewBox = [0, 0, 900, 685];
+let baseViewBoxKey = baseViewBox.join(' ');
+let panning = false, panPointerId = null, lastPointerX = 0, lastPointerY = 0;
 const BASE = '__PATH_PREFIX__';
 
+function parseViewBox(value){
+  const parts = (Array.isArray(value) ? value : String(value || '').trim().split(/\s+/)).map(Number);
+  if(parts.length !== 4 || parts.some(part => !Number.isFinite(part)) || parts[2] <= 0 || parts[3] <= 0){
+    return [0, 0, 900, 685];
+  }
+  return parts;
+}
+function applyViewBox(){
+  const [baseX, baseY, baseWidth, baseHeight] = baseViewBox;
+  const width = baseWidth / zoom, height = baseHeight / zoom;
+  const x = baseX + (baseWidth - width) / 2 + panX;
+  const y = baseY + (baseHeight - height) / 2 + panY;
+  document.getElementById('svg').setAttribute('viewBox', `${x} ${y} ${width} ${height}`);
+  const changed = Math.abs(zoom - 1) > 0.001 || Math.abs(panX) > 0.001 || Math.abs(panY) > 0.001;
+  document.getElementById('reset-view').classList.toggle('hidden', !changed);
+}
+function syncBaseViewBox(value){
+  const next = parseViewBox(value);
+  const nextKey = next.join(' ');
+  if(nextKey !== baseViewBoxKey){
+    baseViewBox = next;
+    baseViewBoxKey = nextKey;
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+  }
+  applyViewBox();
+}
+function resetView(){
+  zoom = 1;
+  panX = 0;
+  panY = 0;
+  applyViewBox();
+}
+
+function applyTheme(theme, persist=true){
+  const selected = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = selected;
+  COLORS = COLOR_THEMES[selected];
+  const button = document.getElementById('theme-toggle');
+  const dark = selected === 'dark';
+  button.textContent = dark ? '☀️' : '🌙';
+  button.title = dark ? 'Switch to light theme' : 'Switch to dark theme';
+  if(persist){
+    try{ localStorage.setItem('agent-viz-theme', selected); }catch(_error){}
+  }
+  if(lastState) render(lastState);
+}
+function toggleTheme(){
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+}
+let initialTheme = 'light';
+try{ initialTheme = localStorage.getItem('agent-viz-theme') || 'light'; }catch(_error){}
+applyTheme(initialTheme, false);
+
 function render(state){
+  lastState = state;
   const gi = document.getElementById('goal-input');
   if(document.activeElement !== gi) gi.value = state.goal;
   document.getElementById('elapsed').textContent = fmtTime(state.elapsed);
@@ -788,6 +989,7 @@ function render(state){
   const pct = (state.loop_state.done / state.loop_state.total) * 100;
   document.getElementById('progress-fill').style.width = pct+'%';
   const svg = document.getElementById('svg');
+  syncBaseViewBox(state.viewBox);
   svg.replaceChildren();
   const ns = 'http://www.w3.org/2000/svg';
   state.edges.forEach(e => {
@@ -799,19 +1001,19 @@ function render(state){
     line.setAttribute('x1',fx); line.setAttribute('y1',fy);
     line.setAttribute('x2',tx); line.setAttribute('y2',ty);
     line.setAttribute('stroke-width','1.5');
-    if(f.status==='running'){ line.setAttribute('stroke','#e6c300'); line.classList.add('pulse'); }
-    else if(f.status==='done' && t.status!=='pending') line.setAttribute('stroke','#a8e6cf');
-    else line.setAttribute('stroke','#d0d7de');
+    if(f.status==='running'){ line.setAttribute('stroke',COLORS.edgeRunning); line.classList.add('pulse'); }
+    else if(f.status==='done' && t.status!=='pending') line.setAttribute('stroke',COLORS.edgeDone);
+    else line.setAttribute('stroke',COLORS.edge);
     svg.appendChild(line);
     if(e.label){
       const lbg = document.createElementNS(ns,'rect');
       lbg.setAttribute('x',mx - e.label.length*3 - 4); lbg.setAttribute('y',my - 9);
       lbg.setAttribute('width',e.label.length*6 + 8); lbg.setAttribute('height',16);
-      lbg.setAttribute('rx','3'); lbg.setAttribute('fill','#f6f8fa');
+      lbg.setAttribute('rx','3'); lbg.setAttribute('fill',COLORS.labelBg);
       svg.appendChild(lbg);
       const lt = document.createElementNS(ns,'text');
       lt.setAttribute('x',mx); lt.setAttribute('y',my + 3);
-      lt.setAttribute('fill','#656d76'); lt.setAttribute('font-size','9');
+      lt.setAttribute('fill',COLORS.muted); lt.setAttribute('font-size','9');
       lt.setAttribute('text-anchor','middle');
       lt.setAttribute('font-family','SF Mono,monospace');
       lt.textContent = e.label;
@@ -826,30 +1028,29 @@ function render(state){
     g.addEventListener('click', () => showDetail(n));
     const rect = document.createElementNS(ns,'rect');
     rect.setAttribute('width',NODE_W); rect.setAttribute('height',NODE_H);
-    rect.setAttribute('rx','8'); rect.setAttribute('fill',COLORS[n.status]||'#eaeef2');
-    rect.setAttribute('stroke','#d0d7de');
+    rect.setAttribute('rx','8'); rect.setAttribute('fill',COLORS.nodes[n.status]||COLORS.nodes.pending);
+    rect.setAttribute('stroke',COLORS.edge);
     rect.setAttribute('stroke-width',n.status==='running'?'2':'1.5');
     if(n.status==='running') rect.classList.add('pulse');
     g.appendChild(rect);
-    const dot_colors = {pending:'#8b949e',queued:'#d4a017',running:'#e6c300',done:'#2da44e',blocked:'#cf222e',warning:'#e67e00'};
     const dot = document.createElementNS(ns,'circle');
     dot.setAttribute('cx',14); dot.setAttribute('cy',14);
-    dot.setAttribute('r',5); dot.setAttribute('fill',dot_colors[n.status]||'#8b949e');
+    dot.setAttribute('r',5); dot.setAttribute('fill',COLORS.dots[n.status]||COLORS.dots.pending);
     if(n.status==='running') dot.classList.add('pulse');
     g.appendChild(dot);
     const label = document.createElementNS(ns,'text');
     label.setAttribute('x',28); label.setAttribute('y',18);
-    label.setAttribute('fill','#1f2328'); label.setAttribute('font-size','12');
+    label.setAttribute('fill',COLORS.text); label.setAttribute('font-size','12');
     label.setAttribute('font-weight','600'); label.textContent = n.label;
     g.appendChild(label);
     const task = document.createElementNS(ns,'text');
     task.setAttribute('x',12); task.setAttribute('y',38);
-    task.setAttribute('fill','#656d76'); task.setAttribute('font-size','11');
+    task.setAttribute('fill',COLORS.muted); task.setAttribute('font-size','11');
     task.textContent = n.task;
     g.appendChild(task);
     const tok = document.createElementNS(ns,'text');
     tok.setAttribute('x',12); tok.setAttribute('y',55);
-    tok.setAttribute('fill','#58a6ff'); tok.setAttribute('font-size','11');
+    tok.setAttribute('fill',COLORS.accent); tok.setAttribute('font-size','11');
     tok.setAttribute('font-family','SF Mono,monospace');
     tok.textContent = n.tokens ? `🔥 ${fmtNum(n.tokens)} tokens` : '';
     g.appendChild(tok);
@@ -857,11 +1058,11 @@ function render(state){
       const badge = document.createElementNS(ns,'rect');
       badge.setAttribute('x',NODE_W-56); badge.setAttribute('y',6);
       badge.setAttribute('width',48); badge.setAttribute('height',16);
-      badge.setAttribute('rx','4'); badge.setAttribute('fill','#8b2e2e');
+      badge.setAttribute('rx','4'); badge.setAttribute('fill',COLORS.badge);
       g.appendChild(badge);
       const bt = document.createElementNS(ns,'text');
       bt.setAttribute('x',NODE_W-54); bt.setAttribute('y',18);
-      bt.setAttribute('fill','#fff'); bt.setAttribute('font-size','9');
+      bt.setAttribute('fill',COLORS.badgeText); bt.setAttribute('font-size','9');
       bt.setAttribute('font-weight','600'); bt.textContent = 'BLOCKED';
       g.appendChild(bt);
     }
@@ -894,7 +1095,7 @@ function render(state){
     const summary = document.createElement('div');
     summary.className = 'ls-item';
     summary.style.marginTop = '4px';
-    summary.style.color = '#8b949e';
+    summary.style.color = COLORS.muted;
     summary.textContent = state.loop_state.summary;
     ls.appendChild(summary);
   }
@@ -991,7 +1192,42 @@ document.getElementById('goal-input').addEventListener('blur', e => {
 });
 document.querySelector('#speed-btns button:nth-child(1)').classList.add('sel');
 document.getElementById('btn-play').classList.add('on');
-document.getElementById('canvas-panel').addEventListener('click', e => {
+const canvasPanel = document.getElementById('canvas-panel');
+canvasPanel.addEventListener('wheel', e => {
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  zoom = Math.min(3, Math.max(0.5, zoom * factor));
+  applyViewBox();
+}, {passive:false});
+canvasPanel.addEventListener('pointerdown', e => {
+  if(e.button !== 0 || e.target.closest('[data-nid], button')) return;
+  panning = true;
+  panPointerId = e.pointerId;
+  lastPointerX = e.clientX;
+  lastPointerY = e.clientY;
+  canvasPanel.classList.add('panning');
+  canvasPanel.setPointerCapture(e.pointerId);
+});
+canvasPanel.addEventListener('pointermove', e => {
+  if(!panning || e.pointerId !== panPointerId) return;
+  const svgRect = document.getElementById('svg').getBoundingClientRect();
+  if(svgRect.width <= 0 || svgRect.height <= 0) return;
+  panX -= (e.clientX - lastPointerX) * (baseViewBox[2] / svgRect.width) / zoom;
+  panY -= (e.clientY - lastPointerY) * (baseViewBox[3] / svgRect.height) / zoom;
+  lastPointerX = e.clientX;
+  lastPointerY = e.clientY;
+  applyViewBox();
+});
+function endPan(e){
+  if(!panning || e.pointerId !== panPointerId) return;
+  panning = false;
+  panPointerId = null;
+  canvasPanel.classList.remove('panning');
+  if(canvasPanel.hasPointerCapture(e.pointerId)) canvasPanel.releasePointerCapture(e.pointerId);
+}
+canvasPanel.addEventListener('pointerup', endPan);
+canvasPanel.addEventListener('pointercancel', endPan);
+canvasPanel.addEventListener('click', e => {
   if(!e.target.closest('[data-nid]')) closeDetail();
 });
 </script>
@@ -1083,9 +1319,18 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return event_id if 0 <= event_id <= 2**63 - 1 else None
 
+    @staticmethod
+    def _local_path(path):
+        if PATH_PREFIX and path.startswith(PATH_PREFIX + "/"):
+            return path[len(PATH_PREFIX):]
+        return path
+
     def do_GET(self):
         path = urlparse(self.path).path
-        if path == "/":
+        local_path = self._local_path(path)
+        if local_path == "/api/state":
+            self._send_json(200, state_snapshot())
+        elif path == "/":
             self._send_html(self._html_for_base(""))
         elif PATH_PREFIX and path == PATH_PREFIX + "/":
             self._send_html(self._html_for_base(PATH_PREFIX))
@@ -1132,7 +1377,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path != "/control" and not (PATH_PREFIX and path == PATH_PREFIX + "/control"):
+        local_path = self._local_path(path)
+        if local_path.startswith("/api/"):
+            self._handle_api_post(local_path)
+            return
+        if local_path != "/control":
             self._send_json(404, {"ok": False, "error": "not found"})
             return
 
@@ -1188,6 +1437,124 @@ class Handler(BaseHTTPRequestHandler):
             }
         self._send_json(200, response)
 
+    def _handle_api_post(self, path):
+        if path == "/api/reset":
+            stop_simulation()
+            reset_state(_bypass_context=True)
+            broadcast()
+            self._send_json(200, {"ok": True, "state": state_snapshot()})
+            return
+
+        allowed_statuses = {"pending", "queued", "running", "done", "blocked"}
+        try:
+            body = self._read_json_body()
+        except RequestError as error:
+            self._send_json(error.status, {"ok": False, "error": error.message})
+            return
+
+        if path.startswith("/api/node/"):
+            node_id = unquote(path[len("/api/node/"):])
+            if not node_id or "/" in node_id:
+                self._send_json(400, {"ok": False, "error": "invalid node id"})
+                return
+            updates = {}
+            if "status" in body:
+                status = body["status"]
+                if not isinstance(status, str) or status not in allowed_statuses:
+                    self._send_json(400, {
+                        "ok": False,
+                        "error": "status must be pending, queued, running, done, or blocked",
+                    })
+                    return
+                updates["status"] = status
+            if "tokens" in body:
+                tokens = body["tokens"]
+                if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                    self._send_json(400, {
+                        "ok": False,
+                        "error": "tokens must be a non-negative integer",
+                    })
+                    return
+                updates["tokens"] = tokens
+            if not updates:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "provide at least one of status or tokens",
+                })
+                return
+            if not update_node(node_id, _bypass_context=True, **updates):
+                self._send_json(404, {"ok": False, "error": "node not found"})
+                return
+            broadcast()
+            self._send_json(200, {"ok": True, "id": node_id, **updates})
+            return
+
+        if path == "/api/log":
+            msg = body.get("msg")
+            if not isinstance(msg, str) or not msg or len(msg) > 10000:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "msg must be a non-empty string of at most 10000 characters",
+                })
+                return
+            add_log(msg, _bypass_context=True)
+            broadcast()
+            self._send_json(200, {"ok": True})
+            return
+
+        if path == "/api/metrics":
+            total_tokens = body.get("total_tokens")
+            total_cost = body.get("total_cost")
+            if (
+                isinstance(total_tokens, bool)
+                or not isinstance(total_tokens, int)
+                or total_tokens < 0
+            ):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "total_tokens must be a non-negative integer",
+                })
+                return
+            if (
+                isinstance(total_cost, bool)
+                or not isinstance(total_cost, (int, float))
+                or not math.isfinite(total_cost)
+                or total_cost < 0
+            ):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "total_cost must be a finite non-negative number",
+                })
+                return
+            with STATE_LOCK:
+                STATE["total_tokens"] = total_tokens
+                STATE["total_cost"] = total_cost
+            broadcast()
+            self._send_json(200, {"ok": True})
+            return
+
+        if path == "/api/loop-state":
+            done = body.get("done")
+            summary = body.get("summary")
+            if isinstance(done, bool) or not isinstance(done, int) or done < 0:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "done must be a non-negative integer",
+                })
+                return
+            if not isinstance(summary, str) or len(summary) > 10000:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "summary must be a string of at most 10000 characters",
+                })
+                return
+            update_loop_state(done=done, summary=summary, _bypass_context=True)
+            broadcast()
+            self._send_json(200, {"ok": True})
+            return
+
+        self._send_json(404, {"ok": False, "error": "not found"})
+
     def log_message(self, *args):
         pass
 
@@ -1197,6 +1564,11 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     public_path = PATH_PREFIX or "/"
+    if load_persisted_state():
+        print("Loaded persisted state")
+    else:
+        print("Starting fresh")
+    print(f"Topology: {TOPOLOGY_SOURCE}")
     print(f"Agent Loop Visualizer → http://127.0.0.1:{PORT}{public_path}")
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     try:
