@@ -1,0 +1,4 @@
+agent-manager-state.json
+agent-manager-state.json.tmp
+__pycache__/
+*.pyc
