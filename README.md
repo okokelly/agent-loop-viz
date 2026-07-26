@@ -1,158 +1,146 @@
-# Agent Loop Visualizer
+# Agent Manager (v3)
 
-Real-time SVG flowchart dashboard for multi-agent loop execution. Single-file, zero-dependency Python server with SSE streaming and a REST API for external agent integration.
+A **solo developer's management layer for AI agents**. Not a chat tool — a place
+to manage the several agents you're running in parallel the way you'd manage a
+team: Kanban, Table, Dashboard, Inbox. Single machine, one user, no accounts, no
+team/collaboration features.
 
-## What it does
+> Solo ≠ single agent. One person running 5 agents at once *is* managing a team —
+> the team just happens to be agents. v3 keeps the management layer and drops
+> only the multi-person parts (sharing, per-person permissions, team canvases).
 
-Renders a live flowchart showing agent loop topology — orchestrator → workers → verifier → reinforce cycles. Each node shows status (pending/queued/running/done/blocked), token consumption, and task description. Edges show data flow between nodes.
+## Two levels of visibility
 
-## Quick Start
+**Top level — across all tasks**
+- **Dashboard** — counts by status, a live activity feed, and **shared memory**
+  (learnings each agent leaves for the next one, so they stop re-deriving the
+  same project facts).
+- **Kanban** — Todo / In Progress / Review / Blocked / Done. Cards show the
+  agent, its current step, and a mini loop-progress bar.
+- **Table** — the same tasks, dense and sortable-by-eye.
+- **Inbox** — only the tasks that need *you* (blocked or ready-for-review), each
+  with the reason. This is the "which window was waiting on me?" fix.
 
-```bash
-# Default (GSB demo topology)
-python3 server.py 8767
-# → http://127.0.0.1:8767
+**Drill-down — one task**
+- Click any task to open its **loop flowchart**: orchestrator → subagents →
+  verifier, with live status and token burn per node. A blocked or long-running
+  subagent is highlighted, so you see **exactly which step is stuck** — the
+  visualizer carried over from v1/v2, now scoped to a single task.
 
-# Custom topology
-python3 server.py 8767 --topology my-topology.json
-# → http://127.0.0.1:8767
-```
-
-Optionally serve behind a reverse proxy (nginx, cloudflared) with a custom path prefix:
-
-```bash
-AGENT_VIZ_PATH_PREFIX=/research python3 server.py 8767
-# → http://127.0.0.1:8767/research/
-```
-
-## Features
-
-- **Interactive controls:** Play/Pause, 1×/2×/5× speed, Restart, Replay at 5×
-- **Node detail panel:** Click any node to see task details and token count
-- **Event log sidebar:** Timestamped color-coded logs + LOOP-STATE.md summary
-- **Light/dark mode:** Toggle in header, persisted to localStorage
-- **SVG zoom/pan:** Mouse wheel zoom (0.5–3×) + drag to pan, reset button
-- **REST API:** Push real state updates from external agents (see below)
-- **State persistence:** Auto-save to `agent-viz-state.json`, reloaded on restart
-- **Configurable topology:** Load custom node graphs from JSON files
-- **Mobile responsive:** SVG viewBox scaling, overlay panels on small screens
-- **Zero dependencies:** Python stdlib only — `http.server` + `threading` + `json`
-
-## Topology Config
-
-Define your own node graph in a JSON file:
-
-```json
-{
-  "goal": "My Research Project",
-  "viewBox": [0, 0, 900, 700],
-  "nodes": [
-    {"id": "orch", "label": "Orchestrator", "x": 450, "y": 35, "task": "Plan and dispatch"},
-    {"id": "w1", "label": "Worker A", "x": 250, "y": 150, "task": "Process dataset A"},
-    {"id": "w2", "label": "Worker B", "x": 650, "y": 150, "task": "Process dataset B"},
-    {"id": "ver", "label": "Verifier", "x": 450, "y": 280, "task": "Cross-check results"}
-  ],
-  "edges": [
-    {"from": "orch", "to": "w1", "label": "delegate"},
-    {"from": "orch", "to": "w2", "label": "delegate"},
-    {"from": "w1", "to": "ver", "label": "results"},
-    {"from": "w2", "to": "ver", "label": "results"}
-  ]
-}
-```
-
-Load it with:
+## Quick start
 
 ```bash
-python3 server.py 8767 --topology my-topology.json
-# or via env var:
-AGENT_VIZ_TOPOLOGY=my-topology.json python3 server.py 8767
+python3 server.py 8768
+# → http://127.0.0.1:8768
 ```
 
-## REST API
+The built-in solo-dev demo **auto-runs on first launch** (5 agents moving through
+their loops, one getting blocked, one landing in review). **⟳** restarts it, **⏸/▶**
+pauses. Toggle light/dark with 🌙. State auto-persists to `agent-manager-state.json`.
+Set `AGENT_MGR_AUTOSTART=0` to launch with a quiet board instead.
 
-Real agents can push state updates via POST endpoints. All return `{"ok": true}` on success.
+### UI you can drive
+- **Drag & drop** cards between Kanban columns → pushes a status change.
+- **Inbox quick actions** — *Unblock* a blocked task, *Approve → Done* or *Send
+  back* a review — same buttons live in the drill-down modal.
+- **Search** (`/` to focus) filters tasks across Kanban / Table / Inbox.
+- **Sortable table** — click any column header.
+- **Keyboard** — `1`–`4` switch views, `/` search, `Esc` close modal. The 🔔
+  bell (with a count) jumps to whatever needs you.
 
-### `GET /api/state`
-Return current dashboard state as JSON (for debugging).
-
-### `POST /api/reset`
-Reset all state for a new run.
+Optional path prefix for a reverse proxy:
 
 ```bash
-curl -X POST http://127.0.0.1:8767/api/reset
+AGENT_MGR_PATH_PREFIX=/agents python3 server.py 8768
+# → http://127.0.0.1:8768/agents/
 ```
 
-### `POST /api/node/{id}`
-Update a node's status and/or token count.
+## How your real agents feed it
 
+The browser updates live over SSE. Your agents push state over a small REST API
+(`data source = agents report`). All endpoints return `{"ok": true}` on success.
+
+### `POST /api/task/{id}` — task-level (feeds Kanban / Inbox / Table)
 ```bash
-curl -X POST http://127.0.0.1:8767/api/node/orch \
+curl -X POST http://127.0.0.1:8768/api/task/t3 \
   -H 'Content-Type: application/json' \
-  -d '{"status": "running", "tokens": 2500}'
+  -d '{"status":"blocked","todo":"needs macOS runner secret",
+       "attention_reason":"Blocked: missing MACOS_RUNNER_TOKEN — needs you"}'
 ```
+Fields: `status` (`todo|running|review|blocked|done`), `title`, `todo`, `agent`,
+`avatar`, `attention_reason`, `needs_attention`. A task set to `review`/`blocked`
+enters the Inbox automatically.
 
-Valid statuses: `pending`, `queued`, `running`, `done`, `blocked`
-
-### `POST /api/log`
-Push a log entry to the event sidebar.
-
+### `POST /api/task/{id}/node/{node_id}` — subagent-level (feeds the drill-down loop)
 ```bash
-curl -X POST http://127.0.0.1:8767/api/log \
+curl -X POST http://127.0.0.1:8768/api/task/t3/node/w1 \
   -H 'Content-Type: application/json' \
-  -d '{"msg": "Worker A completed — 5 subagents, ~120KB"}'
+  -d '{"status":"blocked","tokens":5300}'
 ```
+Node `status`: `pending|queued|running|done|blocked`.
 
-### `POST /api/metrics`
-Update the total token/cost counters in the header.
-
+### `POST /api/learning` — append to shared memory
 ```bash
-curl -X POST http://127.0.0.1:8767/api/metrics \
+curl -X POST http://127.0.0.1:8768/api/learning \
   -H 'Content-Type: application/json' \
-  -d '{"total_tokens": 485000, "total_cost": 0.211}'
+  -d '{"text":"Auth uses express-session + Redis, not Passport.",
+       "task":"Refactor auth → JWT","agent":"auth-agent"}'
 ```
 
-### `POST /api/loop-state`
-Update loop progress fields.
+### `POST /api/activity` — one line to the activity feed
+### `POST /api/reset` — clear the board and reload the demo tasks
+### `GET  /api/state` — current state as JSON (debugging)
 
-```bash
-curl -X POST http://127.0.0.1:8767/api/loop-state \
-  -H 'Content-Type: application/json' \
-  -d '{"done": 3, "summary": "Phase 1 complete: 5/12 nodes done"}'
-```
-
-### Integration pattern
-
+### Integration sketch
 ```python
-# In your agent orchestrator:
 import requests
+VIZ = "http://127.0.0.1:8768"
 
-def on_subagent_complete(node_id, status, tokens, log_msg):
-    requests.post(f"{VIZ_URL}/api/node/{node_id}", json={
-        "status": status, "tokens": tokens
-    })
-    requests.post(f"{VIZ_URL}/api/log", json={"msg": log_msg})
+def on_step(task_id, node_id, status, tokens):
+    requests.post(f"{VIZ}/api/task/{task_id}/node/{node_id}",
+                  json={"status": status, "tokens": tokens})
+
+def on_blocked(task_id, why):
+    requests.post(f"{VIZ}/api/task/{task_id}",
+                  json={"status": "blocked", "attention_reason": why})
 ```
 
-The SSE stream pushes all state changes to connected browsers in real time.
+## Data model
 
-## State Persistence
-
-State is auto-saved to `agent-viz-state.json` on every state change. On restart, the server reloads the file if it's less than 24 hours old. Add to `.gitignore` — it's a runtime artifact.
+```
+task {
+  id, title, agent, avatar, status, todo,
+  needs_attention, attention_reason, tags, tokens, updated_at,
+  graph: {                      # ← the drill-down loop
+    viewBox,
+    nodes: [ {id, label, x, y, status, tokens, task} ],
+    edges: [ {from, to, label} ]
+  }
+}
+learnings: [ {time, task, agent, text} ]   # shared memory
+activity:  [ "[hh:mm:ss] …" ]              # global feed
+```
 
 ## Architecture
 
 ```
-Browser ← SSE stream → Python server (single file)
-                          ├── / → HTML/SVG dashboard
-                          ├── /stream → SSE endpoint
-                          ├── /api/* → REST state update endpoints
-                          └── POST /control → play/pause/speed/restart
+Browser ← SSE ← Python server (single file, stdlib only)
+                  ├── /                → HTML dashboard (Dashboard/Kanban/Table/Inbox + modal)
+                  ├── /stream          → SSE
+                  ├── /api/task/*      → agent push (task + subagent)
+                  ├── /api/learning    → shared memory
+                  ├── /api/activity    → activity feed
+                  └── /control         → play / pause / restart the demo
 ```
 
-## Customizing the Simulation
+Ported from v2: the SSE broadcast, atomic state persistence, and the
+cancellable-simulation threading model.
 
-The built-in `simulate_loop()` is a GSB research demo. For real use, push state via the REST API from your actual agent orchestrator. The simulation runs automatically on "Start" — skip it by loading a custom topology and using the API instead.
+## Not in this MVP (deliberately)
+
+Multi-person sharing, per-person file permissions, custom/whiteboard views, and
+the full Role/Apprentice system with verification rules. Those are the team-scale
+and long-term-moat features — out of scope for the solo MVP.
 
 ## License
 

@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Agent Loop Visualizer — Groundweave: Multi-Agent Architecture Research
-Real timeline from 2026-07-17 18:03–18:55
+Agent Manager (v3) — Solo dev's AI-agent management layer.
+
+Two levels of visibility for one person running many agents in parallel:
+
+  * Top level   — Dashboard / Kanban / Table / Inbox across ALL tasks.
+  * Drill-down  — click any task to see its loop flowchart (orchestrator →
+                  subagents → verifier) and exactly which step is stuck.
+
+Single file, zero dependencies (Python stdlib). Agents push state over a small
+REST API; the browser updates live over SSE. Built for a single machine / one
+user — no accounts, no multi-person collaboration.
+
+Reuses the SSE / persistence / cancellable-simulation machinery from v2.
 """
 import copy
 import json
@@ -17,49 +28,32 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import unquote, urlparse
 
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
+
 try:
-    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8766
+    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8768
 except (TypeError, ValueError):
     raise SystemExit("PORT must be an integer")
 if not 1 <= PORT <= 65535:
     raise SystemExit("PORT must be between 1 and 65535")
-
-
-def topology_path_from_args(args):
-    topology_path = None
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--topology":
-            index += 1
-            if index >= len(args) or args[index].startswith("--"):
-                raise SystemExit("--topology requires a JSON file path")
-            topology_path = args[index]
-        elif arg.startswith("--topology="):
-            topology_path = arg.split("=", 1)[1]
-            if not topology_path:
-                raise SystemExit("--topology requires a JSON file path")
-        else:
-            raise SystemExit(f"unknown argument: {arg}")
-        index += 1
-    return topology_path
-
-
-TOPOLOGY_PATH = topology_path_from_args(sys.argv[2:]) or os.environ.get(
-    "AGENT_VIZ_TOPOLOGY"
-)
-TOPOLOGY_SOURCE = "built-in GSB default"
 
 MAX_CONTENT_LENGTH = 64 * 1024
 MAX_SSE_CLIENTS = 32
 REQUEST_TIMEOUT = 10
 SSE_HEARTBEAT_INTERVAL = 15
 SSE_WRITE_TIMEOUT = 10
-STATE_FILE = os.path.join(os.getcwd(), "agent-viz-state.json")
+STATE_FILE = os.path.join(os.getcwd(), "agent-manager-state.json")
 STATE_MAX_AGE_SECONDS = 24 * 60 * 60
+
+TASK_STATUSES = ("todo", "running", "review", "blocked", "done")
+NODE_STATUSES = ("pending", "queued", "running", "done", "blocked")
+TOKEN_COST_PER_M = 0.435
+MAX_ACTIVITY = 40
+MAX_LEARNINGS = 30
+AUTO_START_DEMO = os.environ.get("AGENT_MGR_AUTOSTART", "1") != "0"
 
 
 def normalize_path_prefix(value):
@@ -69,113 +63,110 @@ def normalize_path_prefix(value):
     return "/" + value
 
 
-PATH_PREFIX = normalize_path_prefix(os.environ.get("AGENT_VIZ_PATH_PREFIX", ""))
+PATH_PREFIX = normalize_path_prefix(os.environ.get("AGENT_MGR_PATH_PREFIX", ""))
 
-# ── Multi-Agent Research: Actual Timeline ──────────────────────
-# Timestamps: 18:03–18:55 HKT, 2026-07-17
-# Budget: 4 passes max, 200 Brave queries, 2h wall-clock
+
+# ── Data model ─────────────────────────────────────────────────
+# A *task* is owned by an agent and carries management-level fields (for the
+# Kanban / Inbox / Table) plus a *graph* — the loop it runs internally, used
+# for the drill-down flowchart.
+
+def build_graph(orch_task, workers, ver_task):
+    """Lay out a plan → workers → verify loop for the drill-down view."""
+    nodes = [{"id": "orch", "label": "Plan", "x": 320, "y": 48,
+              "status": "pending", "tokens": 0, "task": orch_task}]
+    edges = []
+    count = len(workers)
+    for index, (label, task) in enumerate(workers):
+        wid = f"w{index + 1}"
+        x = 320 + (index - (count - 1) / 2) * 200
+        nodes.append({"id": wid, "label": label, "x": x, "y": 180,
+                      "status": "pending", "tokens": 0, "task": task})
+        edges.append({"from": "orch", "to": wid, "label": ""})
+        edges.append({"from": wid, "to": "ver", "label": ""})
+    nodes.append({"id": "ver", "label": "Verify", "x": 320, "y": 312,
+                  "status": "pending", "tokens": 0, "task": ver_task})
+    return {"viewBox": "0 0 640 380", "nodes": nodes, "edges": edges}
+
+
+def make_task(tid, title, agent, avatar, status, todo, graph, tags=None):
+    return {
+        "id": tid,
+        "title": title,
+        "agent": agent,
+        "avatar": avatar,
+        "status": status,
+        "todo": todo,
+        "tags": tags or [],
+        "needs_attention": status in ("review", "blocked"),
+        "attention_reason": "",
+        "tokens": 0,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "graph": graph,
+    }
+
+
+def initial_tasks():
+    return [
+        make_task(
+            "t1", "Refactor auth → JWT", "auth-agent", "🔐", "todo",
+            "Waiting for dispatch",
+            build_graph(
+                "Map session-cookie flow, list risks",
+                [("Implement", "Swap to JWT issue/verify"),
+                 ("Migrate", "Backfill existing sessions"),
+                 ("Tests", "Run auth + e2e suite")],
+                "Independent security re-check"),
+            ["backend", "security"]),
+        make_task(
+            "t2", "Write REST API docs", "docs-agent", "📝", "todo",
+            "Waiting for dispatch",
+            build_graph(
+                "Enumerate endpoints from routes",
+                [("Draft", "Write per-endpoint reference"),
+                 ("Examples", "Add curl + response samples")],
+                "Lint links, check completeness"),
+            ["docs"]),
+        make_task(
+            "t3", "Fix flaky CI on macOS", "ci-agent", "🧪", "todo",
+            "Waiting for dispatch",
+            build_graph(
+                "Reproduce flake, bisect commits",
+                [("Diagnose", "Trace race in test harness"),
+                 ("Patch", "Add retry + fix timer")],
+                "Re-run 50× to confirm stable"),
+            ["infra"]),
+        make_task(
+            "t4", "Add dark mode toggle", "ui-agent", "🎨", "todo",
+            "Waiting for dispatch",
+            build_graph(
+                "Audit hardcoded colors",
+                [("Tokens", "Extract CSS variables"),
+                 ("Toggle", "Wire persisted switch")],
+                "Visual diff light vs dark"),
+            ["frontend"]),
+        make_task(
+            "t5", "Migrate DB schema v4", "db-agent", "🗄️", "todo",
+            "Waiting for dispatch",
+            build_graph(
+                "Draft migration + rollback plan",
+                [("Write", "Author up/down migrations"),
+                 ("Dry-run", "Apply to shadow DB")],
+                "Verify row counts + constraints"),
+            ["backend", "data"]),
+    ]
+
+
 STATE = {
-    "goal": "Groundweave: Multi-Agent Architecture & Stack Research (7 dims)",
-    "viewBox": "0 0 900 685",
+    "project": "agent-loop-viz  ·  solo dev",
     "elapsed": 0,
     "total_tokens": 0,
     "total_cost": 0.0,
-    "loop_state": {
-        "done": 0, "total": 12, "blocked": [], "summary": "",
-        "passes": 0, "new_glossary": 0, "new_people": 0, "new_reading": 0,
-    },
-    "nodes": [
-        # Row 1: Pre-Flight
-        {"id": "orch", "label": "Pre-Flight", "x": 450, "y": 35,
-         "status": "pending", "tokens": 0, "task": "Plan audit, scope, pre-flight checklist"},
-        # Row 2: Launch 1 Source Farm (3 groups, processed serially)
-        {"id": "f1", "label": "Farm: Frameworks", "x": 130, "y": 145,
-         "status": "pending", "tokens": 0, "task": "LangGraph,CrewAI,AutoGen,OpenAI,Anthropic (5 subagents)"},
-        {"id": "f2", "label": "Farm: Deep-Dives", "x": 450, "y": 145,
-         "status": "pending", "tokens": 0, "task": "Orchestration,Protocols,Production,Commercial (4 subagents)"},
-        {"id": "f3", "label": "Farm: Ecosystem", "x": 770, "y": 145,
-         "status": "pending", "tokens": 0, "task": "China,Dify,Coze,KeyPeople (3 subagents)"},
-        # Row 3: Integration
-        {"id": "integ", "label": "Integrator", "x": 450, "y": 270,
-         "status": "pending", "tokens": 0, "task": "Build Glossary/People/Reading v1 — 16T/10P/27R"},
-        # Row 4: Reinforce P1 (3×3 = 9 subagents)
-        {"id": "rA1", "label": "P1: Loop A", "x": 150, "y": 400,
-         "status": "pending", "tokens": 0, "task": "Glossary → People (4 terms → origin/coiner)"},
-        {"id": "rB1", "label": "P1: Loop B", "x": 450, "y": 400,
-         "status": "pending", "tokens": 0, "task": "People → Reading+Terms (3 groups)"},
-        {"id": "rC1", "label": "P1: Loop C", "x": 750, "y": 400,
-         "status": "pending", "tokens": 0, "task": "Reading → Authors+Terms (2 groups)"},
-        # Row 5: Reinforce P2 (1×3 = 3 subagents)
-        {"id": "rA2", "label": "P2: Loop A", "x": 250, "y": 520,
-         "status": "pending", "tokens": 0, "task": "NEW terms → origin (15 terms)"},
-        {"id": "rB2", "label": "P2: Loop B", "x": 450, "y": 520,
-         "status": "pending", "tokens": 0, "task": "NEW people → article+terms (15 people)"},
-        {"id": "rC2", "label": "P2: Loop C", "x": 650, "y": 520,
-         "status": "pending", "tokens": 0, "task": "NEW readings → bios (4 articles)"},
-        # Row 6: Verifier
-        {"id": "ver", "label": "Verifier", "x": 450, "y": 640,
-         "status": "pending", "tokens": 0, "task": "Independent fact-check — 9-point checklist, 27 terms"},
-    ],
-    "edges": [
-        {"from": "orch", "to": "f1", "label": "5 frameworks"},
-        {"from": "orch", "to": "f2", "label": "patterns+prod+commercial"},
-        {"from": "orch", "to": "f3", "label": "china+people"},
-        {"from": "f1", "to": "integ", "label": "~120KB raw"},
-        {"from": "f2", "to": "integ", "label": "~100KB raw"},
-        {"from": "f3", "to": "integ", "label": "~80KB raw"},
-        {"from": "integ", "to": "rA1", "label": "v1: 16T/10P/27R"},
-        {"from": "integ", "to": "rB1", "label": "all entries"},
-        {"from": "integ", "to": "rC1", "label": "all entries"},
-        {"from": "rA1", "to": "rA2", "label": "+80T/+22P"},
-        {"from": "rB1", "to": "rB2", "label": "+4R"},
-        {"from": "rC1", "to": "rC2", "label": "detail-fill"},
-        {"from": "rA2", "to": "ver", "label": "diminishing→STOP"},
-        {"from": "rB2", "to": "ver", "label": "v2: 27T/18P/31R"},
-        {"from": "rC2", "to": "ver", "label": ""},
-    ],
-    "logs": [],
+    "tasks": initial_tasks(),
+    "learnings": [],
+    "activity": [],
 }
-
-
-def load_topology(path):
-    try:
-        with open(path, "r", encoding="utf-8") as topology_file:
-            topology = json.load(topology_file)
-    except FileNotFoundError:
-        raise SystemExit(f"topology file not found: {path}")
-    except OSError as error:
-        raise SystemExit(f"could not read topology file {path}: {error}")
-    except json.JSONDecodeError as error:
-        raise SystemExit(
-            f"invalid topology JSON in {path} at line {error.lineno}, "
-            f"column {error.colno}: {error.msg}"
-        )
-
-    if not isinstance(topology, dict):
-        raise SystemExit(f"invalid topology in {path}: root must be a JSON object")
-    required = {"nodes": list, "edges": list, "goal": str}
-    for key, expected_type in required.items():
-        if key not in topology:
-            raise SystemExit(f"invalid topology in {path}: missing '{key}'")
-        if not isinstance(topology[key], expected_type):
-            raise SystemExit(
-                f"invalid topology in {path}: '{key}' must be "
-                f"{expected_type.__name__}"
-            )
-    if "viewBox" in topology and not isinstance(topology["viewBox"], (str, list)):
-        raise SystemExit(
-            f"invalid topology in {path}: 'viewBox' must be a string or list"
-        )
-
-    STATE.update(
-        {key: copy.deepcopy(topology[key]) for key in ("nodes", "edges", "goal", "viewBox")
-         if key in topology}
-    )
-
-
-if TOPOLOGY_PATH:
-    load_topology(TOPOLOGY_PATH)
-    TOPOLOGY_SOURCE = os.path.abspath(TOPOLOGY_PATH)
 
 STATE_LOCK = threading.RLock()
 PERSISTENCE_LOCK = threading.Lock()
@@ -183,6 +174,7 @@ SSE_CLIENTS = []
 CONTROL = {"paused": False, "speed": 1.0, "running": False}
 
 
+# ── Cancellable simulation machinery (ported from v2) ──────────
 class RunCancelled(Exception):
     """Raised when a simulation loses ownership of the active run."""
 
@@ -230,7 +222,6 @@ def ensure_current(context=None):
 
 
 def state_snapshot():
-    """Copy state while locked; callers may serialize the copy without the lock."""
     with STATE_LOCK:
         return copy.deepcopy(STATE)
 
@@ -279,7 +270,6 @@ def load_persisted_state():
         return False
     if age >= STATE_MAX_AGE_SECONDS:
         return False
-
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as state_file:
             persisted = json.load(state_file)
@@ -289,7 +279,6 @@ def load_persisted_state():
     if not isinstance(persisted, dict):
         print("Warning: persisted state must be a JSON object", file=sys.stderr)
         return False
-
     with STATE_LOCK:
         STATE.update(copy.deepcopy(persisted))
     return True
@@ -309,7 +298,6 @@ def broadcast():
         try:
             client_queue.put_nowait(payload)
         except queue.Full:
-            # Keep only the newest full snapshot for slow clients.
             try:
                 client_queue.get_nowait()
             except queue.Empty:
@@ -368,32 +356,15 @@ def set_paused(paused):
     broadcast()
 
 
-def toggle_paused():
-    now = time.monotonic()
-    with STATE_LOCK:
-        context = _active_context
-        paused = not CONTROL["paused"]
-        if paused:
-            CONTROL["paused"] = True
-            if context is not None and context.started_at and context.paused_since is None:
-                context.paused_since = now
-        else:
-            CONTROL["paused"] = False
-            if context is not None and context.paused_since is not None:
-                context.paused_total += now - context.paused_since
-                context.paused_since = None
-    broadcast()
-
-
 def set_speed(speed):
     with STATE_LOCK:
         CONTROL["speed"] = speed
     broadcast()
 
 
-def wait_tick(s, context=None):
+def wait_tick(seconds, context=None):
     context = current_context() if context is None else context
-    remaining = float(s)
+    remaining = float(seconds)
     while remaining > 0:
         ensure_current(context)
         with STATE_LOCK:
@@ -411,87 +382,110 @@ def wait_tick(s, context=None):
     broadcast()
 
 
-def update_node(nid, _bypass_context=False, **kwargs):
+# ── Task-level mutations ───────────────────────────────────────
+def _find_task_locked(tid):
+    for task in STATE["tasks"]:
+        if task["id"] == tid:
+            return task
+    return None
+
+
+def _recompute_attention(task, explicit=None, reason=None):
+    if explicit is not None:
+        task["needs_attention"] = bool(explicit)
+    else:
+        task["needs_attention"] = task["status"] in ("review", "blocked")
+    if reason is not None:
+        task["attention_reason"] = reason
+    elif not task["needs_attention"]:
+        task["attention_reason"] = ""
+
+
+def set_task(tid, _bypass_context=False, reason=None, needs_attention=None, **fields):
     context = current_context()
     if not _bypass_context:
         ensure_current(context)
     with STATE_LOCK:
         if not _bypass_context and not _is_current_locked(context):
             raise RunCancelled
-        for n in STATE["nodes"]:
-            if n["id"] == nid:
-                n.update(kwargs)
+        task = _find_task_locked(tid)
+        if task is None:
+            return False
+        for key, value in fields.items():
+            if key in ("id", "graph"):
+                continue
+            task[key] = value
+        _recompute_attention(task, explicit=needs_attention, reason=reason)
+        task["updated_at"] = time.time()
+        return True
+
+
+def set_node(tid, nid, _bypass_context=False, **fields):
+    context = current_context()
+    if not _bypass_context:
+        ensure_current(context)
+    with STATE_LOCK:
+        if not _bypass_context and not _is_current_locked(context):
+            raise RunCancelled
+        task = _find_task_locked(tid)
+        if task is None:
+            return False
+        for node in task["graph"]["nodes"]:
+            if node["id"] == nid:
+                node.update(fields)
+                task["updated_at"] = time.time()
                 return True
-    return False
+        return False
 
 
-def complete_node(nid, _bypass_context=False):
-    context = current_context()
-    if not _bypass_context:
-        ensure_current(context)
-    with STATE_LOCK:
-        if not _bypass_context and not _is_current_locked(context):
-            raise RunCancelled
-        for n in STATE["nodes"]:
-            if n["id"] == nid:
-                if n["status"] != "done":
-                    n["status"] = "done"
-                    STATE["loop_state"]["done"] += 1
-                return True
-    return False
-
-
-def add_log(msg: str, _bypass_context=False):
-    context = current_context()
-    if not _bypass_context:
-        ensure_current(context)
-    t = time.strftime("%H:%M:%S")
-    with STATE_LOCK:
-        if not _bypass_context and not _is_current_locked(context):
-            raise RunCancelled
-        STATE["logs"].append(f"[{t}] {msg}")
-        if len(STATE["logs"]) > 14:
-            STATE["logs"] = STATE["logs"][-14:]
-
-
-def update_loop_state(_bypass_context=False, **kwargs):
-    context = current_context()
-    if not _bypass_context:
-        ensure_current(context)
-    with STATE_LOCK:
-        if not _bypass_context and not _is_current_locked(context):
-            raise RunCancelled
-        STATE["loop_state"].update(kwargs)
-
-
-def increment_loop_state(field, amount):
+def burn(tid, nid, amount):
     context = current_context()
     ensure_current(context)
     with STATE_LOCK:
         if not _is_current_locked(context):
             raise RunCancelled
-        STATE["loop_state"][field] += amount
+        STATE["total_tokens"] += amount
+        STATE["total_cost"] = round(STATE["total_tokens"] / 1_000_000 * TOKEN_COST_PER_M, 4)
+        task = _find_task_locked(tid)
+        if task is None:
+            return
+        task["tokens"] += amount
+        for node in task["graph"]["nodes"]:
+            if node["id"] == nid:
+                node["tokens"] += amount
+                break
 
 
-def burn_tokens(nid, tick_count, tok_range, delay=0.6):
+def add_activity(msg, _bypass_context=False):
     context = current_context()
-    lo, hi = tok_range
-    for _ in range(tick_count):
+    if not _bypass_context:
         ensure_current(context)
-        tok = random.randint(lo, hi)
-        with STATE_LOCK:
-            if not _is_current_locked(context):
-                raise RunCancelled
-            STATE["total_tokens"] += tok
-            STATE["total_cost"] = round(STATE["total_tokens"] / 1000000 * 0.435, 4)
-            for n in STATE["nodes"]:
-                if n["id"] == nid:
-                    n["tokens"] += tok
-                    break
-        wait_tick(delay, context)
+    stamp = time.strftime("%H:%M:%S")
+    with STATE_LOCK:
+        if not _bypass_context and not _is_current_locked(context):
+            raise RunCancelled
+        STATE["activity"].append(f"[{stamp}] {msg}")
+        if len(STATE["activity"]) > MAX_ACTIVITY:
+            STATE["activity"] = STATE["activity"][-MAX_ACTIVITY:]
 
 
-def reset_state(context=None, _bypass_context=False):
+def add_learning(text, task_title="", agent="", _bypass_context=False):
+    context = current_context()
+    if not _bypass_context:
+        ensure_current(context)
+    stamp = time.strftime("%H:%M")
+    with STATE_LOCK:
+        if not _bypass_context and not _is_current_locked(context):
+            raise RunCancelled
+        STATE["learnings"].insert(0, {
+            "time": stamp, "task": task_title, "agent": agent, "text": text,
+        })
+        if len(STATE["learnings"]) > MAX_LEARNINGS:
+            STATE["learnings"] = STATE["learnings"][:MAX_LEARNINGS]
+
+
+def reset_state(_bypass_context=False):
+    context = current_context()
     if not _bypass_context:
         ensure_current(context)
     with STATE_LOCK:
@@ -500,19 +494,14 @@ def reset_state(context=None, _bypass_context=False):
         STATE["elapsed"] = 0
         STATE["total_tokens"] = 0
         STATE["total_cost"] = 0.0
-        STATE["loop_state"] = {
-            "done": 0, "total": len(STATE["nodes"]), "blocked": [], "summary": "",
-            "passes": 0, "new_glossary": 0, "new_people": 0, "new_reading": 0,
-        }
-        for n in STATE["nodes"]:
-            n["status"] = "pending"
-            n["tokens"] = 0
-        STATE["logs"] = []
+        STATE["tasks"] = initial_tasks()
+        STATE["learnings"] = []
+        STATE["activity"] = []
 
 
-def metrics_snapshot():
-    with STATE_LOCK:
-        return STATE["total_tokens"], STATE["total_cost"]
+# ── Solo-dev demo simulation ───────────────────────────────────
+def _dispatch(tid, todo):
+    set_task(tid, status="running", todo=todo)
 
 
 def simulate_loop(context):
@@ -524,193 +513,103 @@ def simulate_loop(context):
             context.paused_since = context.started_at
     _thread_context.run = context
 
-    # Reset
-    reset_state(context)
+    reset_state()
+    add_activity("Solo dev online — 5 agents standing by")
     broadcast()
-
-    # ══════════════ PHASE 0: PRE-FLIGHT (18:03–18:09) ══════════════
-    update_node("orch", status="running")
-    add_log("18:03 Pre-Flight: audit plan, define scope (7 research dims)")
-    wait_tick(0.8)
-    burn_tokens("orch", 2, (2000, 4000))
-    add_log("Scope: frameworks, orchestration, protocols, production, china, commercial, people")
     wait_tick(0.6)
-    burn_tokens("orch", 2, (1500, 3000))
-    add_log("Domain probe: 9/9 HTTP 200 ✅ · Budget: 4 passes, 200 Brave, 2h")
-    wait_tick(0.5)
-    add_log("18:09 Pre-flight complete. /background Launch 1 → 12 subagents")
-    complete_node("orch")
-    wait_tick(0.4)
 
-    # ══════════════ PHASE 1: LAUNCH 1 FARM (18:09–18:18, 12 subagents) ══════════════
-    for fid in ["f1", "f2", "f3"]:
-        update_node(fid, status="queued")
-    wait_tick(0.5)
-
-    # Farm 1 — Frameworks (5 subagents: LangGraph, CrewAI, AutoGen, OpenAI, Anthropic)
-    update_node("f1", status="running")
-    add_log("18:09 Farm:Frameworks — processing 5 deep-dives serially...")
+    # ── t1: Refactor auth → JWT (runs a full loop, finishes) ──────
+    _dispatch("t1", "Planning JWT refactor")
+    set_node("t1", "orch", status="running")
+    add_activity("auth-agent 🔐 dispatched: Refactor auth → JWT")
     wait_tick(0.8)
-    burn_tokens("f1", 4, (5000, 9000), 1.2)
-    add_log("18:15 3/5 done: autogen, crewai, langgraph ~85KB")
-    wait_tick(0.6)
-    burn_tokens("f1", 3, (4000, 7000), 1.0)
-    add_log("18:16 5/5 done: +openai-agents, anthropic-patterns ~120KB total")
-    complete_node("f1")
-    add_log("Farm:Frameworks ✅ 5 subagents · ~120KB")
-    wait_tick(0.3)
-
-    # Farm 2 — Deep-Dives (4 subagents: orchestration, protocols, production, commercial)
-    update_node("f2", status="running")
-    add_log("18:15 Farm:DeepDives — orchestration patterns, protocols, production stack...")
-    wait_tick(0.6)
-    burn_tokens("f2", 4, (4000, 8000), 1.0)
-    add_log("18:16 3/4: protocols, production-stack, orchestration-patterns ~100KB")
-    wait_tick(0.5)
-    burn_tokens("f2", 2, (3000, 5000), 0.8)
-    add_log("18:17 +commercial-landscape, frameworks-comparison")
-    complete_node("f2")
-    add_log("Farm:DeepDives ✅ 4 subagents · ~100KB")
-    wait_tick(0.3)
-
-    # Farm 3 — Ecosystem (3 subagents: China, Key People, Bee/Meta)
-    update_node("f3", status="running")
-    add_log("18:16 Farm:Ecosystem — China (Dify,Coze,Baidu) + Key People + emerging...")
-    wait_tick(0.6)
-    burn_tokens("f3", 3, (3000, 6000), 1.0)
-    add_log("18:17 3/3: china-ecosystem, key-people, bee-agent ~80KB")
-    complete_node("f3")
-    add_log("Farm:Ecosystem ✅ 3 subagents · ~80KB")
-    add_log("18:18 🎯 LAUNCH 1: 12/12 subagents complete · ~300KB raw research")
-    wait_tick(0.4)
-
-    # ══════════════ PHASE 2: INTEGRATION 1 (18:18–18:29) ══════════════
-    update_node("integ", status="queued")
-    wait_tick(0.3)
-    update_node("integ", status="running")
-    add_log("18:18 Integrator: reading 12 subagent files → extracting terms, people, articles...")
+    burn("t1", "orch", 3200)
+    add_learning("Auth uses express-session + Redis, NOT Passport. JWT must "
+                 "coexist during migration.", "Refactor auth → JWT", "auth-agent")
+    set_node("t1", "orch", status="done")
+    set_node("t1", "w1", status="running")
+    set_task("t1", todo="Implementing JWT issue/verify")
+    add_activity("auth-agent 🔐 plan done → implementing")
+    wait_tick(0.9)
+    burn("t1", "w1", 5400)
+    set_node("t1", "w1", status="done")
+    set_node("t1", "w2", status="running")
+    set_task("t1", todo="Backfilling existing sessions")
     wait_tick(0.8)
-    burn_tokens("integ", 3, (3000, 5000), 0.7)
-    add_log("Glossary: 16 terms across 6 dimensions")
-    wait_tick(0.5)
-    burn_tokens("integ", 2, (2000, 4000), 0.6)
-    add_log("Key People: 10 profiles · Reading List: 27 entries · URL verify 27/30 ✅")
-    wait_tick(0.5)
-    burn_tokens("integ", 2, (2000, 4000), 0.6)
-    add_log("18:22 Gate 1: DECISIONS_NEEDED.md — 3 blockers, 3 assumptions")
-    wait_tick(0.4)
-    add_log("18:25 Gate 1 approved: dim-grouping keep, focus multi-agent collab, pull CN people")
-    complete_node("integ")
-    add_log("Integration ✅ v1: 16T/10P/27R")
-    wait_tick(0.4)
-
-    # ══════════════ PHASE 3: REINFORCE PASS 1 (18:29–18:33, 3×3=9 subagents) ══════════════
-    update_loop_state(passes=1)
-    for rid in ["rA1", "rB1", "rC1"]:
-        update_node(rid, status="queued")
-    wait_tick(0.4)
-
-    # P1 Loop A: Glossary→People (4 category groups)
-    update_node("rA1", status="running")
-    add_log("18:29 P1: Loop A — Glossary→People: who coined each term? (4 groups)")
-    wait_tick(0.8)
-    burn_tokens("rA1", 3, (4000, 7000), 1.0)
-    add_log("Loop A: found origin/coiners for all 16 terms → +22 new Key People")
-    update_loop_state(new_people=22)
-    complete_node("rA1")
-    add_log("P1 Loop A ✅ +22 people")
-    wait_tick(0.3)
-
-    # P1 Loop B: People→Reading+Terms (3 groups)
-    update_node("rB1", status="running")
-    add_log("18:30 P1: Loop B — People→Terms: what did each person originate?")
+    burn("t1", "w2", 4100)
+    set_node("t1", "w2", status="done")
+    set_node("t1", "w3", status="running")
+    set_task("t1", todo="Running auth + e2e suite")
     wait_tick(0.7)
-    burn_tokens("rB1", 3, (3000, 6000), 1.0)
-    add_log("Loop B: Framework Creators → +17 new terms (Context Engineering, Ambient Agents...))")
-    increment_loop_state("new_glossary", 17)
-    add_log("Big Tech + Academic → +10 more terms (SWE-bench, MAST, 扣子空间...))")
-    increment_loop_state("new_glossary", 10)
-    complete_node("rB1")
-    add_log("P1 Loop B ✅ +27 terms, +4 readings")
-    update_loop_state(new_reading=4)
-    wait_tick(0.3)
-
-    # P1 Loop C: Reading→Authors+Terms (2 groups)
-    update_node("rC1", status="running")
-    add_log("18:31 P1: Loop C — Reading→Authors: who wrote these 27 articles?")
-    wait_tick(0.7)
-    burn_tokens("rC1", 3, (4000, 8000), 1.0)
-    add_log("Loop C: +68 specialized terms from article content")
-    increment_loop_state("new_glossary", 68)
-    add_log("+10+ new people from author bios (Dario Amodei, Zhang Yiming, etc.)")
-    increment_loop_state("new_people", 10)
-    complete_node("rC1")
-    add_log("P1 Loop C ✅ +68 terms, +10 people")
-    wait_tick(0.4)
-
-    add_log("18:33 REINFORCE P1: +80T/+22P/+4R (cross-ref burst!) → 🟢 continue")
-    wait_tick(0.4)
-
-    # ══════════════ PHASE 4: REINFORCE PASS 2 (18:36–18:41, 3 subagents) ══════════════
-    update_loop_state(passes=2)
-    for rid in ["rA2", "rB2", "rC2"]:
-        update_node(rid, status="queued")
-    wait_tick(0.4)
-
-    update_node("rA2", status="running")
-    add_log("18:36 P2: Loop A — NEW terms only: 15 terms → origins (Context Engineering etc.)")
-    wait_tick(0.7)
-    burn_tokens("rA2", 2, (3000, 5000), 0.8)
-    add_log("Fix: 'Context Engineering' was Tobi Lütke (Shopify), not Chase. Chase popularized it.")
-    complete_node("rA2")
-    add_log("P2 Loop A ✅ 16 term origins confirmed (detail-fill, no new cross-refs)")
-
-    update_node("rB2", status="running")
-    add_log("18:39 P2: Loop B — NEW people: 15 bios (Dario Amodei, 王海峰, Charity Majors...)")
+    burn("t1", "w3", 3600)
+    set_node("t1", "w3", status="done")
+    set_node("t1", "ver", status="running")
     wait_tick(0.6)
-    burn_tokens("rB2", 2, (3000, 5000), 0.8)
-    complete_node("rB2")
-    add_log("P2 Loop B ✅ 15 bios filled")
+    burn("t1", "ver", 2200)
+    set_node("t1", "ver", status="done")
+    set_task("t1", status="done", todo="Merged to feature/jwt-auth")
+    add_activity("auth-agent 🔐 ✅ done — all 42 auth tests green")
 
-    update_node("rC2", status="running")
-    add_log("18:40 P2: Loop C — NEW readings: Chase/Moura/Chi Wang/Qingyun Wu latest")
-    wait_tick(0.5)
-    burn_tokens("rC2", 2, (2000, 4000), 0.7)
-    complete_node("rC2")
-    add_log("P2 Loop C ✅ 4 articles confirmed")
-
-    add_log("18:41 DIMINISHING: Pass 2 is detail-fill only — 0 new cross-ref entries → STOP")
-    add_log("Budget: 2/4 passes · ~130/200 Brave · ~12min/2h")
-    wait_tick(0.4)
-
-    # ══════════════ PHASE 5: VERIFIER (18:51–18:55) ══════════════
-    update_node("ver", status="queued")
-    wait_tick(0.5)
-    update_node("ver", status="running")
-    add_log("18:51 Verifier (fresh context): auditing 27 glossary entries — 9-point checklist...")
+    # ── t2: API docs (dispatch, mid-flight) ──────────────────────
+    _dispatch("t2", "Enumerating endpoints from routes")
+    set_node("t2", "orch", status="running")
+    add_activity("docs-agent 📝 dispatched: Write REST API docs")
     wait_tick(0.8)
-    burn_tokens("ver", 2, (2000, 4000), 0.7)
-    add_log("❌ Multi-Agent System: wrong Anthropic blog title")
-    wait_tick(0.5)
-    burn_tokens("ver", 2, (1500, 3000), 0.6)
-    add_log("❌ A2A v1.0: 'Mar 2026' → should be 'Apr 2026'")
-    wait_tick(0.4)
-    add_log("❌ Conversable Agents: 'COLM 2024' → 'ICLR 2024 LLM Agents Workshop'")
-    wait_tick(0.5)
-    burn_tokens("ver", 1, (2000, 3000), 0.5)
-    add_log("Verifier ✅ 15 verified · 7 minor · 3 WRONG (fixed) · 5 unverified")
-    complete_node("ver")
-    wait_tick(0.4)
+    burn("t2", "orch", 2400)
+    set_node("t2", "orch", status="done")
+    set_node("t2", "w1", status="running")
+    set_task("t2", todo="Drafting per-endpoint reference (11 routes)")
+    wait_tick(0.7)
+    burn("t2", "w1", 4800)
 
-    # ══════════════ FINAL ══════════════
-    total_tokens, total_cost = metrics_snapshot()
-    update_loop_state(summary=(
-        f"Groundweave complete: 27 Glossary · 18 Key People · 31 Reading List. "
-        f"2 reinforce passes, diminishing at P2. 3 verifier errors fixed. "
-        f"~130 Brave queries. Total: {total_tokens:,} tokens, ${total_cost:.4f}"
-    ))
-    add_log("18:55 🎯 DELIVERY: glossary-v2.md + key-people-v2.md + reading-list-v2.md")
-    add_log("Project: multi-agent-research/")
+    # ── t3: Fix flaky CI (dispatch → BLOCKED, needs attention) ────
+    _dispatch("t3", "Reproducing the flake")
+    set_node("t3", "orch", status="running")
+    add_activity("ci-agent 🧪 dispatched: Fix flaky CI on macOS")
+    wait_tick(0.8)
+    burn("t3", "orch", 2600)
+    set_node("t3", "orch", status="done")
+    set_node("t3", "w1", status="running")
+    set_task("t3", todo="Tracing race in test harness")
+    wait_tick(0.7)
+    burn("t3", "w1", 3300)
+    set_node("t3", "w1", status="blocked")
+    set_task("t3", status="blocked",
+             todo="Needs macOS runner secret to reproduce",
+             reason="Blocked: missing CI secret MACOS_RUNNER_TOKEN — needs you")
+    add_activity("ci-agent 🧪 ⛔ BLOCKED — missing MACOS_RUNNER_TOKEN")
+    add_learning("Flake only repros on macOS runners; Linux is clean. Root "
+                 "cause is a timer race, not the test itself.", "Fix flaky CI on macOS",
+                 "ci-agent")
+
+    # ── t4: Dark mode (dispatch → REVIEW, needs attention) ───────
+    _dispatch("t4", "Auditing hardcoded colors")
+    set_node("t4", "orch", status="running")
+    add_activity("ui-agent 🎨 dispatched: Add dark mode toggle")
+    wait_tick(0.8)
+    burn("t4", "orch", 2100)
+    set_node("t4", "orch", status="done")
+    set_node("t4", "w1", status="running")
+    set_task("t4", todo="Extracting CSS variables")
+    wait_tick(0.7)
+    burn("t4", "w1", 3900)
+    set_node("t4", "w1", status="done")
+    set_node("t4", "w2", status="running")
+    set_task("t4", todo="Wiring persisted toggle")
+    wait_tick(0.7)
+    burn("t4", "w2", 2800)
+    set_node("t4", "w2", status="done")
+    set_node("t4", "ver", status="running")
+    wait_tick(0.5)
+    burn("t4", "ver", 1500)
+    set_node("t4", "ver", status="done")
+    set_task("t4", status="review",
+             todo="PR #128 open — needs your review",
+             reason="Ready for review: 6 files, +214 −58 · visual diff attached")
+    add_activity("ui-agent 🎨 🔍 ready for review — PR #128")
+
+    # ── t5 stays in Todo; final summary ──────────────────────────
+    add_activity("Board: 1 done · 1 in-progress · 1 review · 1 blocked · 1 todo")
     broadcast()
 
 
@@ -743,16 +642,11 @@ def restart_simulation():
             CONTROL["running"] = True
             CONTROL["paused"] = False
             old_thread = old_context.thread if old_context is not None else None
-
         if old_thread is not None and old_thread is not threading.current_thread():
             old_thread.join()
-
         thread = threading.Thread(
-            target=run_simulation,
-            args=(context,),
-            name=f"simulate-loop-{context.generation}",
-            daemon=True,
-        )
+            target=run_simulation, args=(context,),
+            name=f"simulate-loop-{context.generation}", daemon=True)
         context.thread = thread
         thread.start()
     return context.generation
@@ -774,462 +668,632 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Agent Loop Visualizer</title>
+<title>Agent Manager</title>
 <style>
-:root { --bg: #f6f8fa; --card: #fff; --text: #1f2328; --border: #d0d7de; --accent: #0969da; --muted: #656d76; --danger: #cf222e; --success: #1a7f37; --success-border: #2da44e; --success-bg: #dafbe1; --hover: #eaeef2; --canvas-center: #fff; --overlay: rgba(246,248,250,.92); --shadow-sm: rgba(0,0,0,.06); --shadow-side: rgba(0,0,0,.04); --shadow-lg: rgba(0,0,0,.12); --success-glow: rgba(45,164,78,.3); }
-[data-theme="dark"] { --bg: #0d1117; --card: #161b22; --text: #c9d1d9; --border: #30363d; --accent: #58a6ff; --muted: #8b949e; --danger: #ff7b72; --success: #3fb950; --success-border: #238636; --success-bg: #173b24; --hover: #21262d; --canvas-center: #161b22; --overlay: rgba(13,17,23,.92); --shadow-sm: rgba(0,0,0,.35); --shadow-side: rgba(0,0,0,.3); --shadow-lg: rgba(0,0,0,.45); --success-glow: rgba(63,185,80,.3); }
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
-header{background:var(--card);border-bottom:1px solid var(--border);padding:10px 14px;display:flex;align-items:center;gap:12px;flex-shrink:0;flex-wrap:wrap;min-height:44px;box-shadow:0 1px 3px var(--shadow-sm)}
-header h1{font-size:15px;font-weight:600;color:var(--accent);white-space:nowrap}
-.goal{font-size:12px;color:var(--muted);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.stats{display:flex;gap:12px;font-size:11px;font-family:'SF Mono',monospace}
-.stat-val{color:var(--accent);font-weight:600}
-.live-clock{color:var(--danger);font-variant-numeric:tabular-nums}
-#theme-toggle{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;cursor:pointer;font-size:14px;min-height:32px;min-width:34px;transition:background .2s}
-#theme-toggle:hover{background:var(--hover)}
-#main{flex:1;display:flex;overflow:hidden;position:relative}
-#canvas-panel{flex:1;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at center,var(--canvas-center) 0%,var(--bg) 70%);overflow:hidden;padding:12px;position:relative;touch-action:none;cursor:grab}
-#canvas-panel.panning{cursor:grabbing}
-svg{width:100%;height:auto;max-width:900px}
-#reset-view{position:absolute;top:12px;right:12px;z-index:30;background:var(--card);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:4px;cursor:pointer;font-size:12px;box-shadow:0 1px 3px var(--shadow-sm)}
-#reset-view:hover{background:var(--hover)}
-#reset-view.hidden{display:none}
-#start-overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--overlay);z-index:20;transition:opacity .4s ease;gap:16px}
-#start-overlay.hidden{opacity:0;pointer-events:none}
-#btn-start{font-size:24px;padding:16px 48px;border:2px solid var(--success-border);background:var(--success-bg);color:var(--success);border-radius:8px;cursor:pointer;font-weight:600;letter-spacing:.05em;transition:transform .2s,box-shadow .2s}
-#btn-start:hover{transform:scale(1.05);box-shadow:0 0 24px var(--success-glow)}
-#start-overlay p{color:var(--muted);font-size:13px}
-#controls.hidden{display:none}
-#side-panel{width:340px;background:var(--card);border-left:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;transition:width .3s ease,opacity .3s ease,transform .3s ease;overflow:hidden;z-index:10;box-shadow:-2px 0 8px var(--shadow-side)}
-#side-panel.collapsed{width:0;border-left:none;opacity:0}
-#side-panel h2{font-size:13px;font-weight:600;color:var(--muted);padding:12px 16px;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
-#logs{flex:1;overflow-y:auto;padding:8px;overscroll-behavior:contain}
-.log-line{font-size:12px;color:var(--muted);padding:4px 8px;font-family:'SF Mono',monospace;line-height:1.6;word-break:break-all}
-.log-line.bl{color:var(--danger)}
-.log-line.ok{color:var(--success)}
-#loop-state{padding:12px 16px;border-top:1px solid var(--border);font-size:12px}
-#loop-state .ls-title{color:var(--muted);font-weight:600;margin-bottom:6px}
-#loop-state .ls-item{color:var(--text);padding:2px 0;word-break:break-all}
-#loop-state .ls-blocked{color:var(--danger)}
-#toggle-log{background:var(--bg);border:1px solid var(--border);color:var(--muted);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;transition:background .2s;min-height:32px;min-width:32px}
-#toggle-log:hover{background:var(--hover);color:var(--text)}
-#toggle-log.active{background:var(--success-bg);border-color:var(--success-border);color:var(--success)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.pulse{animation:pulse 1.2s ease-in-out infinite}
-.fade-in{animation:fadeIn .4s ease-out}
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-#controls{display:flex;align-items:center;gap:6px;padding:6px 12px;background:var(--card);border-bottom:1px solid var(--border);flex-shrink:0;min-height:36px}
-#controls button{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;min-width:28px;transition:background .2s}
-#controls button:hover{background:var(--hover)}
-#controls button.on{background:var(--success-bg);border-color:var(--success-border);color:var(--success)}
-#speed-btns{display:flex;gap:2px}
-#speed-btns button{min-width:32px;font-size:11px}
-#speed-btns button.sel{background:var(--success-bg);border-color:var(--success-border);color:var(--success)}
-#progress-wrap{flex:1;margin:0 8px}
-#progress-bar{height:4px;background:var(--border);border-radius:2px;overflow:hidden}
-#progress-fill{height:100%;width:0;background:var(--success-border);transition:width .3s ease;border-radius:2px}
-.goal-input{flex:1;min-width:0;background:transparent;border:none;color:var(--text);font-size:12px;padding:2px 4px;outline:none;font-family:inherit}
-.goal-input:focus{background:var(--bg)}
-#node-detail{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px 20px;z-index:100;min-width:300px;max-width:500px;box-shadow:0 4px 24px var(--shadow-lg);transition:opacity .2s ease,transform .2s ease}
-#node-detail.hidden{opacity:0;transform:translateX(-50%) translateY(10px);pointer-events:none}
-#detail-close{position:absolute;top:8px;right:12px;cursor:pointer;color:var(--muted);font-size:16px}
-#detail-close:hover{color:var(--danger)}
-#detail-content h3{color:var(--accent);font-size:14px;margin-bottom:4px}
-#detail-content p{color:var(--muted);font-size:12px;margin:2px 0}
-@media (max-width: 768px){
-  body{overflow:hidden}
-  header{padding:8px 12px;gap:8px;min-height:40px}
-  header h1{font-size:14px}
-  .goal{font-size:11px;max-width:140px}
-  .stats{gap:8px;font-size:10px}
-  #canvas-panel{padding:8px}
-  #side-panel{position:absolute;top:0;right:0;bottom:0;width:100%;max-width:340px;transform:translateX(0)}
-  #side-panel.collapsed{transform:translateX(100%);width:100%;opacity:0}
-  #toggle-log{padding:6px 12px;font-size:13px}
-  .log-line{font-size:13px;padding:6px 8px}
+:root{
+  --bg:#f4f6fa;--bg2:#eef1f7;--card:#ffffff;--card2:#fafbfd;--text:#161b22;--text2:#3d444d;
+  --border:#e2e6ec;--border2:#d3d9e0;--muted:#6b7480;--hover:#f0f3f8;--col-bg:#eaeef4;
+  --accent:#5b5bf0;--accent2:#8a5cf6;--accent-soft:#ecebfe;--ring:rgba(91,91,240,.35);
+  --shadow-sm:0 1px 2px rgba(20,25,35,.06);--shadow:0 4px 16px rgba(20,25,35,.09);
+  --shadow-lg:0 20px 60px rgba(20,25,35,.24);--glass:rgba(255,255,255,.72);
+  --todo:#7a8593;--todo-bg:#eef1f5;--run:#c07a00;--run-bg:#fff5e0;
+  --review:#7c4dff;--review-bg:#efeaff;--block:#e5484d;--block-bg:#ffeceb;
+  --done:#1f9c54;--done-bg:#e6f7ec;
+  --n-pending:#eef1f5;--n-queued:#fff2cf;--n-running:#fff6dd;--n-done:#dcf5e4;--n-blocked:#ffdedc;
+  --d-pending:#9aa4b1;--d-queued:#d9a01a;--d-running:#efc200;--d-done:#22a85a;--d-blocked:#e5484d;
+  --edge:#d3d9e0;--edge-run:#efc200;--edge-done:#9be0b6;
 }
-@media (max-width: 400px){
-  .goal{display:none}
-  .stats{gap:6px}
+[data-theme="dark"]{
+  --bg:#0b0e14;--bg2:#0e121a;--card:#151a23;--card2:#11161e;--text:#e6edf3;--text2:#adb7c2;
+  --border:#242c38;--border2:#2e3745;--muted:#8b95a3;--hover:#1b212c;--col-bg:#0f141c;
+  --accent:#7b7bff;--accent2:#a780ff;--accent-soft:#211f3d;--ring:rgba(123,123,255,.4);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);--shadow:0 6px 22px rgba(0,0,0,.5);
+  --shadow-lg:0 24px 70px rgba(0,0,0,.7);--glass:rgba(21,26,35,.72);
+  --todo:#8b95a3;--todo-bg:#1a2027;--run:#e3b341;--run-bg:#2c2410;
+  --review:#b18bff;--review-bg:#241d3d;--block:#ff6b6b;--block-bg:#3a1a1c;
+  --done:#3fce74;--done-bg:#0f2a1a;
+  --n-pending:#1a212b;--n-queued:#38300f;--n-running:#3d3512;--n-done:#123021;--n-blocked:#411a1d;
+  --d-pending:#8b95a3;--d-queued:#d9a422;--d-running:#e8c33a;--d-done:#3fce74;--d-blocked:#ff6b6b;
+  --edge:#2e3745;--edge-run:#d9a422;--edge-done:#1f7a45;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{background:linear-gradient(180deg,var(--bg),var(--bg2));color:var(--text);
+  font:13.5px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+  display:flex;flex-direction:column;height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased}
+::selection{background:var(--accent-soft)}
+.mono{font-family:"SF Mono",ui-monospace,"JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+button{font-family:inherit}
+/* header */
+header{background:var(--glass);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--border);padding:9px 16px;display:flex;align-items:center;gap:14px;
+  flex-shrink:0;min-height:52px;z-index:20}
+.brand{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}
+.brand .logo{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;font-size:15px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 2px 8px var(--ring)}
+.brand .nm b{background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.project{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px;padding-left:2px}
+.spacer{flex:1}
+.search{display:flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--border);
+  border-radius:9px;padding:5px 10px;min-width:150px;transition:border-color .15s,box-shadow .15s}
+.search:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+.search input{border:none;background:none;outline:none;color:var(--text);font-size:12.5px;width:100%}
+.search .k{color:var(--muted);font-size:11px}
+.stats{display:flex;gap:16px;font-size:11.5px;color:var(--muted)}
+.stats .v{color:var(--text);font-weight:600}
+.stats .v.acc{color:var(--accent)}
+.ctrl{display:flex;gap:6px;align-items:center}
+.iconbtn{background:var(--card);border:1px solid var(--border);color:var(--text2);width:32px;height:32px;
+  border-radius:9px;cursor:pointer;font-size:13px;display:grid;place-items:center;transition:all .15s}
+.iconbtn:hover{background:var(--hover);color:var(--text);border-color:var(--border2)}
+.bell{position:relative}
+.bell .dot{position:absolute;top:-5px;right:-5px;background:var(--block);color:#fff;font-size:10px;font-weight:700;
+  min-width:16px;height:16px;border-radius:8px;display:grid;place-items:center;padding:0 4px;box-shadow:0 0 0 2px var(--card)}
+/* nav */
+nav{background:var(--card);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:2px;
+  padding:0 14px;flex-shrink:0}
+nav button{background:none;border:none;color:var(--muted);padding:11px 13px;font-size:13px;font-weight:500;
+  cursor:pointer;border-bottom:2px solid transparent;display:flex;align-items:center;gap:7px;transition:color .15s}
+nav button:hover{color:var(--text)}
+nav button.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+nav .cnt{background:var(--col-bg);color:var(--muted);border-radius:20px;font-size:11px;font-weight:600;
+  padding:1px 7px;min-width:20px;text-align:center}
+nav button.active .cnt{background:var(--accent);color:#fff}
+nav .cnt.alert{background:var(--block-bg);color:var(--block)}
+nav button.active .cnt.alert{background:var(--block);color:#fff}
+main{flex:1;overflow:auto;padding:18px}
+.wrap{max-width:1180px;margin:0 auto}
+/* dashboard */
+.tiles{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:18px}
+.tile{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;cursor:pointer;
+  position:relative;overflow:hidden;transition:transform .12s,box-shadow .18s,border-color .18s;box-shadow:var(--shadow-sm)}
+.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--tc)}
+.tile:hover{transform:translateY(-2px);box-shadow:var(--shadow);border-color:var(--border2)}
+.tile .n{font-size:30px;font-weight:750;line-height:1;letter-spacing:-.02em}
+.tile .l{font-size:12px;color:var(--muted);margin-top:6px;display:flex;align-items:center;gap:6px;font-weight:500}
+.tile .l .sw{width:8px;height:8px;border-radius:50%;background:var(--tc)}
+.dash-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:var(--shadow-sm)}
+.panel h3{font-size:11.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;
+  padding:13px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.panel .body{max-height:calc(100vh - 350px);overflow:auto}
+.learn{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;gap:10px}
+.learn:last-child{border-bottom:none}
+.learn .bulb{font-size:15px;line-height:1.4;flex-shrink:0}
+.learn .meta{font-size:11px;color:var(--muted);margin-bottom:2px}
+.learn .txt{font-size:13px;color:var(--text2)}
+.act{padding:8px 16px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);
+  word-break:break-word;display:flex;gap:8px}
+.act:last-child{border-bottom:none}
+.act .t{color:var(--muted);opacity:.7;flex-shrink:0}
+.act.ok .m{color:var(--done)}.act.bl .m{color:var(--block);font-weight:600}.act.rv .m{color:var(--review)}
+.empty{padding:34px 16px;text-align:center;color:var(--muted);font-size:13px}
+.empty .big{font-size:30px;display:block;margin-bottom:8px;opacity:.85}
+/* kanban */
+.board{display:grid;grid-template-columns:repeat(5,minmax(216px,1fr));gap:14px;align-items:start}
+.col{background:var(--col-bg);border-radius:14px;padding:10px;display:flex;flex-direction:column;min-width:0;
+  transition:background .15s,box-shadow .15s;border:1.5px solid transparent}
+.col.drop{background:var(--accent-soft);border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+.col h4{font-size:11.5px;font-weight:700;padding:5px 7px 10px;display:flex;align-items:center;gap:7px;
+  color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.col h4 .sw{width:9px;height:9px;border-radius:50%;box-shadow:0 0 0 3px var(--swg)}
+.col h4 .cnt{margin-left:auto;background:var(--card);border-radius:20px;padding:1px 8px;font-size:11px;color:var(--text2)}
+.cards{display:flex;flex-direction:column;gap:9px;min-height:12px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 12px;cursor:pointer;
+  position:relative;transition:box-shadow .16s,transform .1s,border-color .16s;box-shadow:var(--shadow-sm);
+  border-left:3px solid var(--cc,var(--border))}
+.card:hover{box-shadow:var(--shadow);transform:translateY(-1px);border-color:var(--border2);border-left-color:var(--cc)}
+.card.dragging{opacity:.45;transform:rotate(1.5deg) scale(.98)}
+.card .ttl{font-size:13px;font-weight:650;margin-bottom:7px;line-height:1.35;padding-right:16px}
+.card .todo{font-size:12px;color:var(--muted);margin-bottom:9px;line-height:1.42;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.loopbar{display:flex;gap:3px;margin-bottom:9px}
+.loopbar i{height:5px;flex:1;border-radius:3px;background:var(--n-pending);transition:background .3s}
+.loopbar i.done{background:var(--d-done)}.loopbar i.running{background:var(--d-running)}
+.loopbar i.queued{background:var(--d-queued)}.loopbar i.blocked{background:var(--d-blocked)}
+.card .foot{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--muted)}
+.card .agent{display:flex;align-items:center;gap:5px;font-weight:500;color:var(--text2);min-width:0}
+.card .agent .em{font-size:13px}
+.card .agent .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sdot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.card .meta-r{margin-left:auto;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.card .tok{color:var(--accent)}
+.card .ago{opacity:.75}
+.attn-flag{position:absolute;top:10px;right:11px;font-size:12px}
+.tag{font-size:10px;background:var(--col-bg);color:var(--muted);border-radius:5px;padding:1px 6px;font-weight:500}
+/* status pill */
+.st{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:650;border-radius:20px;
+  padding:2px 9px;white-space:nowrap}
+.st .d{width:6px;height:6px;border-radius:50%;background:currentColor}
+/* table */
+.tbl-wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:var(--shadow-sm)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);
+  padding:11px 14px;border-bottom:1px solid var(--border);font-weight:700;cursor:pointer;user-select:none;white-space:nowrap}
+th:hover{color:var(--text)}
+th .ar{opacity:.5;font-size:9px}
+td{padding:11px 14px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tbody tr{cursor:pointer;transition:background .12s}
+tbody tr:hover{background:var(--hover)}
+.tprog{display:flex;align-items:center;gap:8px}
+.tprog .bar{width:54px;height:5px;border-radius:3px;background:var(--col-bg);overflow:hidden}
+.tprog .bar i{display:block;height:100%;background:var(--d-done);border-radius:3px}
+/* inbox */
+.inbox{display:flex;flex-direction:column;gap:11px;max-width:800px;margin:0 auto}
+.ibx{background:var(--card);border:1px solid var(--border);border-left:3px solid var(--cc);border-radius:12px;
+  padding:14px 16px;cursor:pointer;display:flex;gap:13px;align-items:center;transition:box-shadow .16s,transform .1s;box-shadow:var(--shadow-sm)}
+.ibx:hover{box-shadow:var(--shadow);transform:translateY(-1px)}
+.ibx .ic{font-size:20px;flex-shrink:0}
+.ibx .mid{flex:1;min-width:0}
+.ibx .ttl{font-size:14px;font-weight:650}
+.ibx .reason{font-size:12px;color:var(--muted);margin-top:2px}
+.ibx .acts{display:flex;gap:7px;flex-shrink:0}
+.qbtn{border:1px solid var(--border);background:var(--card2);color:var(--text2);border-radius:8px;padding:5px 11px;
+  font-size:12px;font-weight:600;cursor:pointer;transition:all .14s;white-space:nowrap}
+.qbtn:hover{background:var(--hover);border-color:var(--border2)}
+.qbtn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.qbtn.primary:hover{filter:brightness(1.08)}
+.qbtn.warn{border-color:var(--block);color:var(--block)}
+.qbtn.warn:hover{background:var(--block-bg)}
+/* modal */
+.overlay{position:fixed;inset:0;background:rgba(10,13,20,.5);backdrop-filter:blur(4px);
+  display:flex;align-items:center;justify-content:center;z-index:100;padding:22px;opacity:0;pointer-events:none;transition:opacity .2s}
+.overlay.show{opacity:1;pointer-events:auto}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:18px;width:min(780px,96vw);
+  max-height:92vh;overflow:auto;box-shadow:var(--shadow-lg);transform:scale(.97);transition:transform .2s}
+.overlay.show .modal{transform:scale(1)}
+.mh{padding:18px 20px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:13px;
+  position:sticky;top:0;background:var(--card);z-index:2}
+.mh .av{width:42px;height:42px;border-radius:11px;background:var(--accent-soft);display:grid;place-items:center;font-size:22px;flex-shrink:0}
+.mh .ttl{font-size:17px;font-weight:750;letter-spacing:-.01em}
+.mh .sub{font-size:12px;color:var(--muted);margin-top:6px;display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+.mh .x{margin-left:auto;cursor:pointer;color:var(--muted);font-size:18px;width:30px;height:30px;border-radius:8px;
+  display:grid;place-items:center;transition:all .14s;flex-shrink:0}
+.mh .x:hover{background:var(--hover);color:var(--block)}
+.sec{padding:16px 20px;border-bottom:1px solid var(--border)}
+.sec:last-child{border-bottom:none}
+.sec h5{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:11px;font-weight:700}
+.attn-card{border-radius:12px;padding:13px 15px;display:flex;align-items:center;gap:12px;background:var(--block-bg)}
+.attn-card.review{background:var(--review-bg)}
+.attn-card .em{font-size:20px}
+.attn-card .msg{flex:1;font-size:13px;font-weight:600;color:var(--block)}
+.attn-card.review .msg{color:var(--review)}
+.attn-card .acts{display:flex;gap:8px}
+.graph-wrap{background:radial-gradient(ellipse at 50% 40%,var(--card2),var(--bg));border:1px solid var(--border);
+  border-radius:12px;padding:6px}
+.graph-wrap svg{width:100%;height:auto;display:block}
+.cur{font-size:12px;color:var(--muted);margin-top:10px;display:flex;gap:7px;align-items:center}
+.cur b{color:var(--text2)}
+.mlearn{font-size:13px;padding:7px 0;border-bottom:1px dashed var(--border);color:var(--text2);display:flex;gap:9px}
+.mlearn:last-child{border-bottom:none}
+.tl{display:flex;gap:10px;padding:5px 0;font-size:12px;color:var(--muted)}
+.tl .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-top:5px;flex-shrink:0}
+@media (max-width:920px){
+  .tiles{grid-template-columns:repeat(2,1fr)}
+  .dash-grid{grid-template-columns:1fr}
+  .board{grid-auto-flow:column;grid-template-columns:none;grid-auto-columns:80vw;overflow-x:auto;padding-bottom:8px}
+  .project,.search{display:none}
 }
 </style>
 </head>
 <body>
 <header>
-  <h1>🔭 Agent Loop</h1>
-  <input class="goal-input" id="goal-input" value="Groundweave: Multi-Agent Architecture Research" />
-  <div class="stats">
-    <span>⏱ <span class="stat-val" id="elapsed">00:00</span></span>
-    <span>🕐 <span class="stat-val live-clock" id="clock">--:--:--</span></span>
-    <span>🔥 <span class="stat-val" id="tokens">0</span></span>
-    <span>💰 <span class="stat-val" id="cost">$0</span></span>
+  <span class="brand"><span class="logo">🗂</span><span class="nm">Agent<b>Manager</b></span></span>
+  <span class="project" id="project"></span>
+  <span class="spacer"></span>
+  <label class="search"><span>🔎</span><input id="search" placeholder="Filter tasks…" autocomplete="off"><span class="k">/</span></label>
+  <div class="stats mono">
+    <span>🗂 <span class="v" id="s-tasks">0</span></span>
+    <span>🔥 <span class="v" id="s-tok">0</span></span>
+    <span>💰 <span class="v acc" id="s-cost">$0</span></span>
+    <span id="clock">--:--:--</span>
   </div>
-  <button id="theme-toggle" onclick="toggleTheme()" title="Switch to dark theme" aria-label="Switch color theme">🌙</button>
+  <div class="ctrl">
+    <button class="iconbtn bell" id="bell" onclick="view='inbox';render(lastState)" title="Needs your attention">🔔<span class="dot" id="bell-dot" style="display:none">0</span></button>
+    <button class="iconbtn" id="btn-play" onclick="togglePlay()" title="Play / pause demo">⏸</button>
+    <button class="iconbtn" onclick="doRestart()" title="Restart demo">⟳</button>
+    <button class="iconbtn" id="theme" onclick="toggleTheme()" title="Toggle theme">🌙</button>
+  </div>
 </header>
-<div id="controls" class="hidden">
-  <button id="btn-play" onclick="togglePlay()" title="Play/Pause">⏸</button>
-  <div id="speed-btns">
-    <button onclick="setSpeed(1)">1×</button><button onclick="setSpeed(2)">2×</button><button onclick="setSpeed(5)">5×</button>
-  </div>
-  <button id="btn-restart" onclick="doRestart()" title="Restart">⟳</button>
-  <button id="btn-replay" onclick="doReplay()" title="Replay at 5×">⏩</button>
-  <div id="progress-wrap"><div id="progress-bar"><div id="progress-fill"></div></div></div>
-  <button id="toggle-log" onclick="togglePanel()">📋 Log</button>
+<nav id="tabs"></nav>
+<main><div class="wrap" id="view"></div></main>
+
+<div class="overlay" id="overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal" id="modal"></div>
 </div>
-<div id="main">
-  <div id="canvas-panel">
-    <svg id="svg" viewBox="0 0 900 685" preserveAspectRatio="xMidYMid meet"></svg>
-    <button id="reset-view" class="hidden" onclick="resetView()">Reset view</button>
-    <div id="start-overlay">
-      <button id="btn-start" onclick="doStart()">▶ Start</button>
-      <p>Groundweave: Multi-Agent Architecture Research</p>
-    </div>
-  </div>
-  <div id="side-panel" class="collapsed">
-    <h2>📋 Event Log</h2>
-    <div id="logs"></div>
-    <div id="loop-state">
-      <div class="ls-title">📊 LOOP-STATE.md</div>
-      <div id="ls-content"></div>
-    </div>
-  </div>
-</div>
-<div id="node-detail" class="hidden">
-  <div id="detail-close" onclick="closeDetail()">✕</div>
-  <div id="detail-content"></div>
-</div>
+
 <script>
-const NODE_R = 8, NODE_W = 195, NODE_H = 64;
-const COLOR_THEMES = {
-  light: {
-    nodes: {pending:'#eaeef2',queued:'#fff3cd',running:'#fff8e1',done:'#dafbe1',blocked:'#ffd8d8',warning:'#ffe8cc'},
-    dots: {pending:'#8b949e',queued:'#d4a017',running:'#e6c300',done:'#2da44e',blocked:'#cf222e',warning:'#e67e00'},
-    edge:'#d0d7de', edgeRunning:'#e6c300', edgeDone:'#a8e6cf', labelBg:'#f6f8fa',
-    text:'#1f2328', muted:'#656d76', accent:'#0969da', badge:'#8b2e2e', badgeText:'#fff',
-  },
-  dark: {
-    nodes: {pending:'#21262d',queued:'#3b2f12',running:'#3f3410',done:'#173b24',blocked:'#4c1f24',warning:'#462f13'},
-    dots: {pending:'#8b949e',queued:'#d29922',running:'#e3b341',done:'#3fb950',blocked:'#ff7b72',warning:'#d29922'},
-    edge:'#30363d', edgeRunning:'#d29922', edgeDone:'#238636', labelBg:'#0d1117',
-    text:'#c9d1d9', muted:'#8b949e', accent:'#58a6ff', badge:'#6e3035', badgeText:'#f0f6fc',
-  },
-};
-let COLORS = COLOR_THEMES.light;
-let lastState = null;
-let paused = false, speed = 1;
-let zoom = 1, panX = 0, panY = 0;
-let baseViewBox = [0, 0, 900, 685];
-let baseViewBoxKey = baseViewBox.join(' ');
-let panning = false, panPointerId = null, lastPointerX = 0, lastPointerY = 0;
-const BASE = '__PATH_PREFIX__';
+const BASE='__PATH_PREFIX__';
+const NODE_W=168,NODE_H=58;
+const STATUS=[
+  {k:'todo',label:'Todo',emoji:'○'},
+  {k:'running',label:'In Progress',emoji:'◐'},
+  {k:'review',label:'Review',emoji:'◔'},
+  {k:'blocked',label:'Blocked',emoji:'⊘'},
+  {k:'done',label:'Done',emoji:'●'},
+];
+const SMETA=Object.fromEntries(STATUS.map(s=>[s.k,s]));
+const CVAR={todo:'todo',running:'run',review:'review',blocked:'block',done:'done'};
+let lastState=null,view='dashboard',openTask=null,paused=false,filter='',dragging=false;
+let sortKey='status',sortDir=1;
 
-function parseViewBox(value){
-  const parts = (Array.isArray(value) ? value : String(value || '').trim().split(/\s+/)).map(Number);
-  if(parts.length !== 4 || parts.some(part => !Number.isFinite(part)) || parts[2] <= 0 || parts[3] <= 0){
-    return [0, 0, 900, 685];
-  }
-  return parts;
+/* theme */
+function applyTheme(t,persist=true){
+  const sel=t==='dark'?'dark':'light';
+  document.documentElement.dataset.theme=sel;
+  document.getElementById('theme').textContent=sel==='dark'?'☀️':'🌙';
+  if(persist){try{localStorage.setItem('agent-mgr-theme',sel);}catch(e){}}
+  if(lastState)render(lastState);
 }
-function applyViewBox(){
-  const [baseX, baseY, baseWidth, baseHeight] = baseViewBox;
-  const width = baseWidth / zoom, height = baseHeight / zoom;
-  const x = baseX + (baseWidth - width) / 2 + panX;
-  const y = baseY + (baseHeight - height) / 2 + panY;
-  document.getElementById('svg').setAttribute('viewBox', `${x} ${y} ${width} ${height}`);
-  const changed = Math.abs(zoom - 1) > 0.001 || Math.abs(panX) > 0.001 || Math.abs(panY) > 0.001;
-  document.getElementById('reset-view').classList.toggle('hidden', !changed);
-}
-function syncBaseViewBox(value){
-  const next = parseViewBox(value);
-  const nextKey = next.join(' ');
-  if(nextKey !== baseViewBoxKey){
-    baseViewBox = next;
-    baseViewBoxKey = nextKey;
-    zoom = 1;
-    panX = 0;
-    panY = 0;
-  }
-  applyViewBox();
-}
-function resetView(){
-  zoom = 1;
-  panX = 0;
-  panY = 0;
-  applyViewBox();
-}
+function toggleTheme(){applyTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');}
+let it='light';try{it=localStorage.getItem('agent-mgr-theme')||'light';}catch(e){}
+applyTheme(it,false);
 
-function applyTheme(theme, persist=true){
-  const selected = theme === 'dark' ? 'dark' : 'light';
-  document.documentElement.dataset.theme = selected;
-  COLORS = COLOR_THEMES[selected];
-  const button = document.getElementById('theme-toggle');
-  const dark = selected === 'dark';
-  button.textContent = dark ? '☀️' : '🌙';
-  button.title = dark ? 'Switch to light theme' : 'Switch to dark theme';
-  if(persist){
-    try{ localStorage.setItem('agent-viz-theme', selected); }catch(_error){}
-  }
-  if(lastState) render(lastState);
-}
-function toggleTheme(){
-  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
-}
-let initialTheme = 'light';
-try{ initialTheme = localStorage.getItem('agent-viz-theme') || 'light'; }catch(_error){}
-applyTheme(initialTheme, false);
+/* helpers */
+function fmtNum(n){return n>=1000?(n/1000).toFixed(n>=10000?0:1)+'K':String(n);}
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+function ago(ts){const s=Math.max(0,Math.floor(Date.now()/1000-ts));if(s<5)return 'just now';
+  if(s<60)return s+'s ago';const m=Math.floor(s/60);if(m<60)return m+'m ago';const h=Math.floor(m/60);
+  if(h<24)return h+'h ago';return Math.floor(h/24)+'d ago';}
+function loopDone(t){return t.graph.nodes.filter(n=>n.status==='done').length;}
+function progressStr(t){return loopDone(t)+'/'+t.graph.nodes.length;}
+function needsAttn(t){return t.status==='blocked'||t.status==='review'||t.needs_attention;}
+function inbox(state){return state.tasks.filter(needsAttn);}
+function matchFilter(t){if(!filter)return true;const q=filter.toLowerCase();
+  return (t.title+' '+t.agent+' '+t.todo+' '+(t.tags||[]).join(' ')).toLowerCase().includes(q);}
 
+/* SSE */
+const evt=new EventSource(BASE+'/stream');
+evt.onmessage=e=>render(JSON.parse(e.data));
+function updateClock(){document.getElementById('clock').textContent=new Date().toTimeString().split(' ')[0];}
+updateClock();setInterval(updateClock,500);
+/* keep "x ago" fresh + refresh relative times when idle */
+setInterval(()=>{if(lastState&&!dragging&&!openTask&&(view==='kanban'||view==='table'))render(lastState);},20000);
+
+/* pushes */
+function pushTask(id,body){return fetch(BASE+'/api/task/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
+function pushNode(id,nid,body){return fetch(BASE+'/api/task/'+id+'/node/'+nid,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
+async function moveTask(id,status){await pushTask(id,{status});}
+async function unblock(id){const t=lastState.tasks.find(x=>x.id===id);if(t){const n=t.graph.nodes.find(x=>x.status==='blocked');if(n)await pushNode(id,n.id,{status:'running'});}await pushTask(id,{status:'running',needs_attention:false});}
+async function approve(id){await pushTask(id,{status:'done',needs_attention:false});}
+async function sendBack(id){await pushTask(id,{status:'running',needs_attention:false});}
+
+/* top-level render */
 function render(state){
-  lastState = state;
-  const gi = document.getElementById('goal-input');
-  if(document.activeElement !== gi) gi.value = state.goal;
-  document.getElementById('elapsed').textContent = fmtTime(state.elapsed);
-  document.getElementById('tokens').textContent = fmtNum(state.total_tokens);
-  document.getElementById('cost').textContent = '$'+state.total_cost.toFixed(4);
-  const pct = (state.loop_state.done / state.loop_state.total) * 100;
-  document.getElementById('progress-fill').style.width = pct+'%';
-  const svg = document.getElementById('svg');
-  syncBaseViewBox(state.viewBox);
-  svg.replaceChildren();
-  const ns = 'http://www.w3.org/2000/svg';
-  state.edges.forEach(e => {
-    const f = state.nodes.find(n=>n.id===e.from), t = state.nodes.find(n=>n.id===e.to);
-    if(!f||!t) return;
-    const fx = f.x, fy = f.y + NODE_H/2, tx = t.x, ty = t.y - NODE_H/2;
-    const mx = (fx+tx)/2, my = (fy+ty)/2;
-    const line = document.createElementNS(ns,'line');
-    line.setAttribute('x1',fx); line.setAttribute('y1',fy);
-    line.setAttribute('x2',tx); line.setAttribute('y2',ty);
-    line.setAttribute('stroke-width','1.5');
-    if(f.status==='running'){ line.setAttribute('stroke',COLORS.edgeRunning); line.classList.add('pulse'); }
-    else if(f.status==='done' && t.status!=='pending') line.setAttribute('stroke',COLORS.edgeDone);
-    else line.setAttribute('stroke',COLORS.edge);
-    svg.appendChild(line);
-    if(e.label){
-      const lbg = document.createElementNS(ns,'rect');
-      lbg.setAttribute('x',mx - e.label.length*3 - 4); lbg.setAttribute('y',my - 9);
-      lbg.setAttribute('width',e.label.length*6 + 8); lbg.setAttribute('height',16);
-      lbg.setAttribute('rx','3'); lbg.setAttribute('fill',COLORS.labelBg);
-      svg.appendChild(lbg);
-      const lt = document.createElementNS(ns,'text');
-      lt.setAttribute('x',mx); lt.setAttribute('y',my + 3);
-      lt.setAttribute('fill',COLORS.muted); lt.setAttribute('font-size','9');
-      lt.setAttribute('text-anchor','middle');
-      lt.setAttribute('font-family','SF Mono,monospace');
-      lt.textContent = e.label;
-      svg.appendChild(lt);
-    }
+  lastState=state;
+  if(dragging)return;
+  document.getElementById('project').textContent=state.project;
+  document.getElementById('s-tasks').textContent=state.tasks.length;
+  document.getElementById('s-tok').textContent=fmtNum(state.total_tokens);
+  document.getElementById('s-cost').textContent='$'+state.total_cost.toFixed(3);
+  const alerts=inbox(state).length;
+  const bd=document.getElementById('bell-dot');
+  bd.style.display=alerts?'grid':'none';bd.textContent=alerts;
+  renderTabs(state);
+  const v=document.getElementById('view');v.replaceChildren();
+  if(view==='dashboard')v.appendChild(viewDashboard(state));
+  else if(view==='kanban')v.appendChild(viewKanban(state));
+  else if(view==='table')v.appendChild(viewTable(state));
+  else if(view==='inbox')v.appendChild(viewInbox(state));
+  if(openTask){const t=state.tasks.find(x=>x.id===openTask);if(t)fillModal(t);else closeModal();}
+}
+
+function renderTabs(state){
+  const nav=document.getElementById('tabs');nav.replaceChildren();
+  const alerts=inbox(state).length;
+  [{k:'dashboard',label:'Dashboard',icon:'📊'},
+   {k:'kanban',label:'Kanban',icon:'🗂',count:state.tasks.length},
+   {k:'table',label:'Table',icon:'▦',count:state.tasks.length},
+   {k:'inbox',label:'Inbox',icon:'📥',count:alerts,alert:alerts>0}
+  ].forEach(t=>{
+    const b=el('button',view===t.k?'active':'');
+    b.append(el('span',null,t.icon),el('span',null,t.label));
+    if(t.count!=null)b.appendChild(el('span','cnt'+(t.alert?' alert':''),String(t.count)));
+    b.onclick=()=>{view=t.k;render(lastState);};
+    nav.appendChild(b);
   });
-  state.nodes.forEach(n => {
-    const g = document.createElementNS(ns,'g');
-    g.setAttribute('transform',`translate(${n.x - NODE_W/2},${n.y - NODE_H/2})`);
-    g.setAttribute('data-nid', n.id);
-    g.style.cursor = 'pointer';
-    g.addEventListener('click', () => showDetail(n));
-    const rect = document.createElementNS(ns,'rect');
-    rect.setAttribute('width',NODE_W); rect.setAttribute('height',NODE_H);
-    rect.setAttribute('rx','8'); rect.setAttribute('fill',COLORS.nodes[n.status]||COLORS.nodes.pending);
-    rect.setAttribute('stroke',COLORS.edge);
-    rect.setAttribute('stroke-width',n.status==='running'?'2':'1.5');
-    if(n.status==='running') rect.classList.add('pulse');
+}
+
+function statusPill(k){
+  const s=SMETA[k];const p=el('span','st');
+  p.append(el('span','d'),el('span',null,s.label));
+  p.style.color=css('--'+CVAR[k]);p.style.background=css('--'+CVAR[k]+'-bg');
+  return p;
+}
+
+/* ── Dashboard ── */
+function viewDashboard(state){
+  const wrap=el('div');
+  const counts={};STATUS.forEach(s=>counts[s.k]=0);
+  state.tasks.forEach(t=>counts[t.status]=(counts[t.status]||0)+1);
+  const tiles=el('div','tiles');
+  STATUS.forEach(s=>{
+    const tile=el('div','tile');tile.style.setProperty('--tc',css('--'+CVAR[s.k]));
+    tile.appendChild(el('div','n',String(counts[s.k]||0)));
+    const l=el('div','l');l.append(el('span','sw'),el('span',null,s.label));
+    tile.appendChild(l);
+    tile.onclick=()=>{view='kanban';render(lastState);};
+    tiles.appendChild(tile);
+  });
+  wrap.appendChild(tiles);
+
+  const grid=el('div','dash-grid');
+  // learnings
+  const lp=el('div','panel');lp.appendChild(el('h3','','🧠 Shared memory · learnings'));
+  const lb=el('div','body');
+  if(!state.learnings.length){const e=el('div','empty');e.append(el('span','big','🧠'),document.createTextNode('No learnings yet — agents leave notes here for each other.'));lb.appendChild(e);}
+  state.learnings.forEach(x=>{
+    const d=el('div','learn');d.appendChild(el('span','bulb','💡'));
+    const mid=el('div');
+    mid.appendChild(el('div','meta',`${x.time} · ${x.agent||'agent'}${x.task?' · '+x.task:''}`));
+    mid.appendChild(el('div','txt',x.text));
+    d.appendChild(mid);lb.appendChild(d);
+  });
+  lp.appendChild(lb);
+  // activity
+  const ap=el('div','panel');ap.appendChild(el('h3','','⚡ Recent activity'));
+  const ab=el('div','body');
+  if(!state.activity.length){const e=el('div','empty');e.append(el('span','big','⚡'),document.createTextNode('Quiet. Press ▶ / ⟳ to run the demo.'));ab.appendChild(e);}
+  [...state.activity].reverse().forEach(line=>{
+    const m=line.match(/^\[(.*?)\]\s*(.*)$/);
+    const d=el('div','act');
+    if(line.includes('✅'))d.classList.add('ok');
+    if(line.includes('⛔')||line.includes('BLOCKED'))d.classList.add('bl');
+    if(line.includes('🔍'))d.classList.add('rv');
+    d.append(el('span','t mono',m?m[1]:''),el('span','m',m?m[2]:line));
+    ab.appendChild(d);
+  });
+  ap.appendChild(ab);
+  grid.append(lp,ap);wrap.appendChild(grid);
+  return wrap;
+}
+
+/* ── Kanban (drag & drop) ── */
+function viewKanban(state){
+  const board=el('div','board');
+  STATUS.forEach(s=>{
+    const col=el('div','col');col.dataset.status=s.k;
+    const items=state.tasks.filter(t=>t.status===s.k&&matchFilter(t));
+    const h=el('h4');const sw=el('span','sw');
+    sw.style.background=css('--'+CVAR[s.k]);sw.style.setProperty('--swg',css('--'+CVAR[s.k]+'-bg'));
+    h.append(sw,el('span',null,s.label),el('span','cnt',String(items.length)));
+    col.appendChild(h);
+    const cards=el('div','cards');
+    items.forEach(t=>cards.appendChild(taskCard(t)));
+    col.appendChild(cards);
+    // drop handling
+    col.addEventListener('dragover',e=>{e.preventDefault();col.classList.add('drop');});
+    col.addEventListener('dragleave',e=>{if(!col.contains(e.relatedTarget))col.classList.remove('drop');});
+    col.addEventListener('drop',e=>{
+      e.preventDefault();col.classList.remove('drop');
+      const id=e.dataTransfer.getData('text/plain');
+      const task=lastState.tasks.find(x=>x.id===id);
+      if(task&&task.status!==s.k)moveTask(id,s.k);
+    });
+    board.appendChild(col);
+  });
+  return board;
+}
+function taskCard(t){
+  const c=el('div','card');c.style.setProperty('--cc',css('--'+CVAR[t.status]));
+  c.draggable=true;
+  c.addEventListener('dragstart',e=>{dragging=true;e.dataTransfer.setData('text/plain',t.id);e.dataTransfer.effectAllowed='move';c.classList.add('dragging');});
+  c.addEventListener('dragend',()=>{dragging=false;c.classList.remove('dragging');render(lastState);});
+  if(needsAttn(t))c.appendChild(el('div','attn-flag',t.status==='blocked'?'⛔':'🔍'));
+  c.appendChild(el('div','ttl',t.title));
+  c.appendChild(el('div','todo',t.todo));
+  const bar=el('div','loopbar');
+  t.graph.nodes.forEach(n=>{const i=el('i');if(n.status!=='pending')i.classList.add(n.status);bar.appendChild(i);});
+  c.appendChild(bar);
+  const foot=el('div','foot');
+  const ag=el('div','agent');
+  const dot=el('span','sdot');dot.style.background=css('--'+CVAR[t.status]);
+  ag.append(dot,el('span','em',t.avatar),el('span','nm',t.agent));
+  foot.appendChild(ag);
+  const r=el('div','meta-r mono');
+  if(t.tokens)r.appendChild(el('span','tok','🔥'+fmtNum(t.tokens)));
+  r.appendChild(el('span','ago',ago(t.updated_at)));
+  foot.appendChild(r);
+  c.appendChild(foot);
+  c.onclick=e=>{if(!dragging)showModal(t.id);};
+  return c;
+}
+
+/* ── Table (sortable) ── */
+function viewTable(state){
+  const cols=[{k:'attn',l:''},{k:'title',l:'Task'},{k:'agent',l:'Agent'},{k:'status',l:'Status'},
+    {k:'todo',l:'Current step'},{k:'loop',l:'Loop'},{k:'tokens',l:'Tokens'},{k:'updated_at',l:'Updated'}];
+  const order={todo:0,running:1,review:2,blocked:3,done:4};
+  let rows=state.tasks.filter(matchFilter).slice();
+  rows.sort((a,b)=>{
+    let x,y;
+    if(sortKey==='status'){x=order[a.status];y=order[b.status];}
+    else if(sortKey==='loop'){x=loopDone(a)/a.graph.nodes.length;y=loopDone(b)/b.graph.nodes.length;}
+    else if(sortKey==='tokens'||sortKey==='updated_at'){x=a[sortKey];y=b[sortKey];}
+    else{x=(a[sortKey]||'').toString().toLowerCase();y=(b[sortKey]||'').toString().toLowerCase();}
+    return (x<y?-1:x>y?1:0)*sortDir;
+  });
+  const wrapEl=el('div','tbl-wrap');
+  const tbl=el('table');const thead=el('thead');const tr=el('tr');
+  cols.forEach(c=>{
+    const th=el('th');th.append(document.createTextNode(c.l+' '));
+    if(c.k===sortKey)th.appendChild(el('span','ar',sortDir>0?'▲':'▼'));
+    if(c.k!=='attn')th.onclick=()=>{if(sortKey===c.k)sortDir*=-1;else{sortKey=c.k;sortDir=1;}render(lastState);};
+    tr.appendChild(th);
+  });
+  thead.appendChild(tr);tbl.appendChild(thead);
+  const tb=el('tbody');
+  rows.forEach(t=>{
+    const row=el('tr');
+    row.appendChild(el('td',null,needsAttn(t)?(t.status==='blocked'?'⛔':'🔍'):''));
+    const td1=el('td');td1.appendChild(el('b',null,t.title));row.appendChild(td1);
+    const td2=el('td');td2.append(el('span',null,t.avatar+' '),el('span',null,t.agent));row.appendChild(td2);
+    const td3=el('td');td3.appendChild(statusPill(t.status));row.appendChild(td3);
+    const td4=el('td',null,t.todo);td4.style.color=css('--muted');row.appendChild(td4);
+    const td5=el('td');const pr=el('div','tprog');const bar=el('div','bar');const fill=el('i');
+    fill.style.width=(loopDone(t)/t.graph.nodes.length*100)+'%';bar.appendChild(fill);
+    pr.append(bar,el('span','mono',progressStr(t)));td5.appendChild(pr);row.appendChild(td5);
+    const tk=el('td','mono',fmtNum(t.tokens));row.appendChild(tk);
+    const tu=el('td','mono',ago(t.updated_at));tu.style.color=css('--muted');row.appendChild(tu);
+    row.onclick=()=>showModal(t.id);
+    tb.appendChild(row);
+  });
+  tbl.appendChild(tb);wrapEl.appendChild(tbl);
+  return wrapEl;
+}
+
+/* ── Inbox (with quick actions) ── */
+function viewInbox(state){
+  const wrap=el('div','inbox');
+  const items=inbox(state).filter(matchFilter);
+  if(!items.length){const e=el('div','empty');e.append(el('span','big','📭'),document.createTextNode('Inbox zero — nothing needs you right now.'));wrap.appendChild(e);return wrap;}
+  items.forEach(t=>{
+    const row=el('div','ibx');row.style.setProperty('--cc',css('--'+CVAR[t.status]));
+    row.appendChild(el('div','ic',t.status==='blocked'?'⛔':'🔍'));
+    const mid=el('div','mid');
+    mid.appendChild(el('div','ttl',t.title));
+    mid.appendChild(el('div','reason',t.attention_reason||t.todo));
+    row.appendChild(mid);
+    const acts=el('div','acts');
+    if(t.status==='blocked'){
+      const b=el('button','qbtn primary','Unblock');b.onclick=e=>{e.stopPropagation();unblock(t.id);};acts.appendChild(b);
+    }else if(t.status==='review'){
+      const a=el('button','qbtn primary','Approve');a.onclick=e=>{e.stopPropagation();approve(t.id);};
+      const s=el('button','qbtn','Send back');s.onclick=e=>{e.stopPropagation();sendBack(t.id);};
+      acts.append(a,s);
+    }
+    row.appendChild(acts);
+    row.onclick=()=>showModal(t.id);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+/* ── Modal / drill-down ── */
+function showModal(id){openTask=id;document.getElementById('overlay').classList.add('show');render(lastState);}
+function closeModal(){openTask=null;document.getElementById('overlay').classList.remove('show');}
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){if(openTask)closeModal();return;}
+  if(e.target.tagName==='INPUT')return;
+  if(e.key==='/'){e.preventDefault();document.getElementById('search').focus();}
+  const map={'1':'dashboard','2':'kanban','3':'table','4':'inbox'};
+  if(map[e.key]){view=map[e.key];render(lastState);}
+});
+
+function fillModal(t){
+  const m=document.getElementById('modal');m.replaceChildren();
+  const mh=el('div','mh');
+  mh.appendChild(el('div','av',t.avatar));
+  const head=el('div');head.style.flex='1';
+  head.appendChild(el('div','ttl',t.title));
+  const sub=el('div','sub');
+  sub.appendChild(statusPill(t.status));
+  sub.appendChild(el('span',null,t.agent));
+  sub.appendChild(el('span','mono','🔥 '+fmtNum(t.tokens)+' tokens'));
+  sub.appendChild(el('span','mono','loop '+progressStr(t)));
+  sub.appendChild(el('span',null,'updated '+ago(t.updated_at)));
+  (t.tags||[]).forEach(tag=>sub.appendChild(el('span','tag',tag)));
+  head.appendChild(sub);mh.appendChild(head);
+  const x=el('div','x','✕');x.onclick=closeModal;mh.appendChild(x);
+  m.appendChild(mh);
+
+  if(needsAttn(t)){
+    const s=el('div','sec');
+    const card=el('div','attn-card'+(t.status==='review'?' review':''));
+    card.appendChild(el('span','em',t.status==='blocked'?'⛔':'🔍'));
+    card.appendChild(el('span','msg',t.attention_reason||t.todo));
+    const acts=el('div','acts');
+    if(t.status==='blocked'){
+      const b=el('button','qbtn primary','Mark unblocked');b.onclick=()=>unblock(t.id);acts.appendChild(b);
+    }else if(t.status==='review'){
+      const a=el('button','qbtn primary','Approve → Done');a.onclick=()=>approve(t.id);
+      const sb=el('button','qbtn warn','Send back');sb.onclick=()=>sendBack(t.id);
+      acts.append(a,sb);
+    }
+    card.appendChild(acts);s.appendChild(card);m.appendChild(s);
+  }
+
+  const gs=el('div','sec');
+  gs.appendChild(el('h5','','Loop · where it is right now'));
+  const gw=el('div','graph-wrap');gw.appendChild(renderGraph(t.graph));gs.appendChild(gw);
+  const cur=el('div','cur');cur.append(el('b',null,'Current:'),document.createTextNode(' '+t.todo));
+  gs.appendChild(cur);m.appendChild(gs);
+
+  const tl=lastState.learnings.filter(l=>l.task===t.title);
+  if(tl.length){
+    const ls=el('div','sec');ls.appendChild(el('h5','','Learnings from this task'));
+    tl.forEach(l=>{const d=el('div','mlearn');d.append(el('span',null,'💡'),el('span',null,l.text));ls.appendChild(d);});
+    m.appendChild(ls);
+  }
+}
+
+/* reuse of v2's SVG flowchart, scoped to one task */
+function renderGraph(graph){
+  const ns='http://www.w3.org/2000/svg';
+  const svg=document.createElementNS(ns,'svg');
+  svg.setAttribute('viewBox',graph.viewBox||'0 0 640 380');
+  svg.setAttribute('preserveAspectRatio','xMidYMid meet');
+  const nodeC={pending:css('--n-pending'),queued:css('--n-queued'),running:css('--n-running'),done:css('--n-done'),blocked:css('--n-blocked')};
+  const dotC={pending:css('--d-pending'),queued:css('--d-queued'),running:css('--d-running'),done:css('--d-done'),blocked:css('--d-blocked')};
+  const edgeC=css('--edge'),edgeRun=css('--edge-run'),edgeDone=css('--edge-done');
+  const textC=css('--text'),mutedC=css('--muted'),accentC=css('--accent'),blockC=css('--block');
+  const byId=id=>graph.nodes.find(n=>n.id===id);
+  graph.edges.forEach(e=>{
+    const f=byId(e.from),t=byId(e.to);if(!f||!t)return;
+    const line=document.createElementNS(ns,'line');
+    line.setAttribute('x1',f.x);line.setAttribute('y1',f.y+NODE_H/2);
+    line.setAttribute('x2',t.x);line.setAttribute('y2',t.y-NODE_H/2);
+    line.setAttribute('stroke-width','1.5');
+    if(f.status==='running'){line.setAttribute('stroke',edgeRun);line.style.animation='dash 1s linear infinite';line.setAttribute('stroke-dasharray','5 4');}
+    else if(f.status==='done'&&t.status!=='pending')line.setAttribute('stroke',edgeDone);
+    else line.setAttribute('stroke',edgeC);
+    svg.appendChild(line);
+  });
+  graph.nodes.forEach(n=>{
+    const g=document.createElementNS(ns,'g');
+    g.setAttribute('transform',`translate(${n.x-NODE_W/2},${n.y-NODE_H/2})`);
+    if(n.status==='running'||n.status==='blocked')g.style.animation='pulse 1.5s ease-in-out infinite';
+    const rect=document.createElementNS(ns,'rect');
+    rect.setAttribute('width',NODE_W);rect.setAttribute('height',NODE_H);rect.setAttribute('rx','10');
+    rect.setAttribute('fill',nodeC[n.status]||nodeC.pending);
+    rect.setAttribute('stroke',n.status==='blocked'?blockC:(n.status==='running'?css('--run'):edgeC));
+    rect.setAttribute('stroke-width',n.status==='running'||n.status==='blocked'?'2':'1.25');
     g.appendChild(rect);
-    const dot = document.createElementNS(ns,'circle');
-    dot.setAttribute('cx',14); dot.setAttribute('cy',14);
-    dot.setAttribute('r',5); dot.setAttribute('fill',COLORS.dots[n.status]||COLORS.dots.pending);
-    if(n.status==='running') dot.classList.add('pulse');
-    g.appendChild(dot);
-    const label = document.createElementNS(ns,'text');
-    label.setAttribute('x',28); label.setAttribute('y',18);
-    label.setAttribute('fill',COLORS.text); label.setAttribute('font-size','12');
-    label.setAttribute('font-weight','600'); label.textContent = n.label;
+    const dot=document.createElementNS(ns,'circle');
+    dot.setAttribute('cx',14);dot.setAttribute('cy',15);dot.setAttribute('r',5);
+    dot.setAttribute('fill',dotC[n.status]||dotC.pending);g.appendChild(dot);
+    const label=document.createElementNS(ns,'text');
+    label.setAttribute('x',27);label.setAttribute('y',19);label.setAttribute('fill',textC);
+    label.setAttribute('font-size','12.5');label.setAttribute('font-weight','700');label.textContent=n.label;
     g.appendChild(label);
-    const task = document.createElementNS(ns,'text');
-    task.setAttribute('x',12); task.setAttribute('y',38);
-    task.setAttribute('fill',COLORS.muted); task.setAttribute('font-size','11');
-    task.textContent = n.task;
-    g.appendChild(task);
-    const tok = document.createElementNS(ns,'text');
-    tok.setAttribute('x',12); tok.setAttribute('y',55);
-    tok.setAttribute('fill',COLORS.accent); tok.setAttribute('font-size','11');
-    tok.setAttribute('font-family','SF Mono,monospace');
-    tok.textContent = n.tokens ? `🔥 ${fmtNum(n.tokens)} tokens` : '';
-    g.appendChild(tok);
+    const task=document.createElementNS(ns,'text');
+    task.setAttribute('x',13);task.setAttribute('y',37);task.setAttribute('fill',mutedC);task.setAttribute('font-size','10.5');
+    task.textContent=n.task.length>29?n.task.slice(0,28)+'…':n.task;g.appendChild(task);
+    const tok=document.createElementNS(ns,'text');
+    tok.setAttribute('x',13);tok.setAttribute('y',51);tok.setAttribute('fill',accentC);tok.setAttribute('font-size','10');
+    tok.setAttribute('font-family','SF Mono,monospace');tok.textContent=n.tokens?('🔥 '+fmtNum(n.tokens)):'';g.appendChild(tok);
     if(n.status==='blocked'){
-      const badge = document.createElementNS(ns,'rect');
-      badge.setAttribute('x',NODE_W-56); badge.setAttribute('y',6);
-      badge.setAttribute('width',48); badge.setAttribute('height',16);
-      badge.setAttribute('rx','4'); badge.setAttribute('fill',COLORS.badge);
-      g.appendChild(badge);
-      const bt = document.createElementNS(ns,'text');
-      bt.setAttribute('x',NODE_W-54); bt.setAttribute('y',18);
-      bt.setAttribute('fill',COLORS.badgeText); bt.setAttribute('font-size','9');
-      bt.setAttribute('font-weight','600'); bt.textContent = 'BLOCKED';
-      g.appendChild(bt);
+      const bt=document.createElementNS(ns,'text');
+      bt.setAttribute('x',NODE_W-13);bt.setAttribute('y',19);bt.setAttribute('text-anchor','end');
+      bt.setAttribute('fill',blockC);bt.setAttribute('font-size','8.5');bt.setAttribute('font-weight','800');
+      bt.setAttribute('letter-spacing','.05em');bt.textContent='BLOCKED';g.appendChild(bt);
     }
     svg.appendChild(g);
   });
-  const logsEl = document.getElementById('logs');
-  logsEl.replaceChildren();
-  state.logs.forEach(l => {
-    const div = document.createElement('div');
-    div.className = 'log-line fade-in';
-    if(l.includes('BLOCKED')||l.includes('\u26a0')) div.className += ' bl';
-    if(l.includes('\u2705')) div.className += ' ok';
-    div.textContent = l;
-    logsEl.appendChild(div);
-  });
-  logsEl.scrollTop = logsEl.scrollHeight;
-  const ls = document.getElementById('ls-content');
-  ls.replaceChildren();
-  const doneItem = document.createElement('div');
-  doneItem.className = 'ls-item';
-  doneItem.textContent = `Done: ${state.loop_state.done}/${state.loop_state.total}`;
-  ls.appendChild(doneItem);
-  state.loop_state.blocked.forEach(b => {
-    const blocked = document.createElement('div');
-    blocked.className = 'ls-item ls-blocked';
-    blocked.textContent = `\u26a0 ${b}`;
-    ls.appendChild(blocked);
-  });
-  if(state.loop_state.summary){
-    const summary = document.createElement('div');
-    summary.className = 'ls-item';
-    summary.style.marginTop = '4px';
-    summary.style.color = COLORS.muted;
-    summary.textContent = state.loop_state.summary;
-    ls.appendChild(summary);
-  }
+  return svg;
 }
 
-function fmtTime(s){return s<60?s+'s':Math.floor(s/60)+'m '+(s%60)+'s'}
-function fmtNum(n){return n>=1000?(n/1000).toFixed(1)+'K':String(n)}
-function updateClock(){
-  const now = new Date();
-  document.getElementById('clock').textContent = now.toTimeString().split(' ')[0];
-}
-updateClock();
-setInterval(updateClock, 200);
+/* controls + search */
+function postControl(action,extra={}){fetch(BASE+'/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});}
+function togglePlay(){paused=!paused;postControl(paused?'pause':'resume');document.getElementById('btn-play').textContent=paused?'▶':'⏸';}
+function doRestart(){postControl('restart');paused=false;document.getElementById('btn-play').textContent='⏸';}
+document.getElementById('search').addEventListener('input',e=>{filter=e.target.value;if(lastState)render(lastState);});
 
-const evt = new EventSource(BASE + '/stream');
-evt.onmessage = e => { render(JSON.parse(e.data)); };
-
-function togglePanel(){
-  const p = document.getElementById('side-panel');
-  const b = document.getElementById('toggle-log');
-  p.classList.toggle('collapsed');
-  b.classList.toggle('on');
-}
-function togglePlay(){
-  paused = !paused;
-  postControl(paused ? 'pause' : 'resume');
-  document.getElementById('btn-play').textContent = paused ? '\u25b6' : '\u23f8';
-  document.getElementById('btn-play').classList.toggle('on', !paused);
-}
-function setSpeed(s){
-  speed = s;
-  postControl('speed', {speed: s});
-  document.querySelectorAll('#speed-btns button').forEach((b,i) => {
-    b.classList.toggle('sel', (i===0&&s===1)||(i===1&&s===2)||(i===2&&s===5));
-  });
-}
-function doRestart(){
-  postControl('restart');
-  document.getElementById('btn-play').textContent = '\u23f8';
-  document.getElementById('btn-play').classList.add('on');
-  paused = false;
-}
-function doStart(){
-  document.getElementById('start-overlay').classList.add('hidden');
-  document.getElementById('controls').classList.remove('hidden');
-  doRestart();
-}
-function doReplay(){
-  setSpeed(5);
-  doRestart();
-}
-function showDetail(n){
-  const d = document.getElementById('node-detail');
-  const c = document.getElementById('detail-content');
-  const colors = {pending:'\u23f3',queued:'\U0001f4cb',running:'\U0001f7e2',done:'\u2705',blocked:'\U0001f534',warning:'\u26a0\ufe0f'};
-  c.replaceChildren();
-  const heading = document.createElement('h3');
-  heading.textContent = `${colors[n.status]||''} ${n.label}`;
-  c.appendChild(heading);
-  const task = document.createElement('p');
-  const taskLabel = document.createElement('b');
-  taskLabel.textContent = 'Task:';
-  task.append(taskLabel, document.createTextNode(` ${n.task}`));
-  c.appendChild(task);
-  const metrics = document.createElement('p');
-  const tokensLabel = document.createElement('b');
-  tokensLabel.textContent = 'Tokens:';
-  const statusLabel = document.createElement('b');
-  statusLabel.textContent = 'Status:';
-  metrics.append(
-    tokensLabel,
-    document.createTextNode(` ${fmtNum(n.tokens)} \u00b7 `),
-    statusLabel,
-    document.createTextNode(` ${n.status}`),
-  );
-  c.appendChild(metrics);
-  d.classList.remove('hidden');
-}
-function closeDetail(){
-  document.getElementById('node-detail').classList.add('hidden');
-}
-function postControl(action, extra={}){
-  fetch(BASE + '/control', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action, ...extra})
-  });
-}
-document.getElementById('goal-input').addEventListener('keydown', e => {
-  if(e.key === 'Enter'){ postControl('goal', {goal: e.target.value}); e.target.blur(); }
-});
-document.getElementById('goal-input').addEventListener('blur', e => {
-  postControl('goal', {goal: e.target.value});
-});
-document.querySelector('#speed-btns button:nth-child(1)').classList.add('sel');
-document.getElementById('btn-play').classList.add('on');
-const canvasPanel = document.getElementById('canvas-panel');
-canvasPanel.addEventListener('wheel', e => {
-  e.preventDefault();
-  const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-  zoom = Math.min(3, Math.max(0.5, zoom * factor));
-  applyViewBox();
-}, {passive:false});
-canvasPanel.addEventListener('pointerdown', e => {
-  if(e.button !== 0 || e.target.closest('[data-nid], button')) return;
-  panning = true;
-  panPointerId = e.pointerId;
-  lastPointerX = e.clientX;
-  lastPointerY = e.clientY;
-  canvasPanel.classList.add('panning');
-  canvasPanel.setPointerCapture(e.pointerId);
-});
-canvasPanel.addEventListener('pointermove', e => {
-  if(!panning || e.pointerId !== panPointerId) return;
-  const svgRect = document.getElementById('svg').getBoundingClientRect();
-  if(svgRect.width <= 0 || svgRect.height <= 0) return;
-  panX -= (e.clientX - lastPointerX) * (baseViewBox[2] / svgRect.width) / zoom;
-  panY -= (e.clientY - lastPointerY) * (baseViewBox[3] / svgRect.height) / zoom;
-  lastPointerX = e.clientX;
-  lastPointerY = e.clientY;
-  applyViewBox();
-});
-function endPan(e){
-  if(!panning || e.pointerId !== panPointerId) return;
-  panning = false;
-  panPointerId = null;
-  canvasPanel.classList.remove('panning');
-  if(canvasPanel.hasPointerCapture(e.pointerId)) canvasPanel.releasePointerCapture(e.pointerId);
-}
-canvasPanel.addEventListener('pointerup', endPan);
-canvasPanel.addEventListener('pointercancel', endPan);
-canvasPanel.addEventListener('click', e => {
-  if(!e.target.closest('[data-nid]')) closeDetail();
-});
+const style=document.createElement('style');
+style.textContent='@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}@keyframes dash{to{stroke-dashoffset:-9}}';
+document.head.appendChild(style);
 </script>
 </body>
 </html>"""
@@ -1279,8 +1343,8 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _html_for_base(base):
         return HTML.replace(
-            "const BASE = '__PATH_PREFIX__';",
-            f"const BASE = {json.dumps(base)};",
+            "const BASE='__PATH_PREFIX__';",
+            f"const BASE={json.dumps(base)};",
         )
 
     def _read_json_body(self):
@@ -1303,8 +1367,6 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise RequestError(400, "invalid JSON")
-        if body is None:
-            raise RequestError(400, "JSON body must not be null")
         if not isinstance(body, dict):
             raise RequestError(400, "JSON body must be an object")
         return body
@@ -1384,58 +1446,37 @@ class Handler(BaseHTTPRequestHandler):
         if local_path != "/control":
             self._send_json(404, {"ok": False, "error": "not found"})
             return
-
         try:
             body = self._read_json_body()
         except RequestError as error:
             self._send_json(error.status, {"ok": False, "error": error.message})
             return
-
         action = body.get("action")
-        allowed_actions = {"pause", "resume", "toggle", "speed", "restart", "goal"}
-        if not isinstance(action, str) or action not in allowed_actions:
+        allowed = {"pause", "resume", "speed", "restart"}
+        if not isinstance(action, str) or action not in allowed:
             self._send_json(400, {"ok": False, "error": "unknown action"})
             return
-
         if action == "speed":
             speed = body.get("speed")
             try:
-                speed_value = (
-                    float(speed)
-                    if not isinstance(speed, bool) and isinstance(speed, (int, float))
-                    else None
-                )
+                value = float(speed) if not isinstance(speed, bool) and isinstance(speed, (int, float)) else None
             except (OverflowError, TypeError, ValueError):
-                speed_value = None
-            if speed_value is None or not math.isfinite(speed_value) or speed_value <= 0:
-                self._send_json(400, {"ok": False, "error": "speed must be a finite number greater than 0"})
+                value = None
+            if value is None or not math.isfinite(value) or value <= 0:
+                self._send_json(400, {"ok": False, "error": "speed must be a finite number > 0"})
                 return
-            set_speed(speed_value)
+            set_speed(value)
         elif action == "pause":
             set_paused(True)
         elif action == "resume":
             set_paused(False)
-        elif action == "toggle":
-            toggle_paused()
         elif action == "restart":
             restart_simulation()
-        elif action == "goal":
-            goal = body.get("goal")
-            if not isinstance(goal, str) or len(goal) > 1000:
-                self._send_json(400, {"ok": False, "error": "goal must be a string of at most 1000 characters"})
-                return
-            with STATE_LOCK:
-                STATE["goal"] = goal
-            broadcast()
-
         with STATE_LOCK:
-            response = {
-                "ok": True,
-                "paused": CONTROL["paused"],
-                "speed": CONTROL["speed"],
-                "running": CONTROL["running"],
-            }
-        self._send_json(200, response)
+            self._send_json(200, {
+                "ok": True, "paused": CONTROL["paused"],
+                "speed": CONTROL["speed"], "running": CONTROL["running"],
+            })
 
     def _handle_api_post(self, path):
         if path == "/api/reset":
@@ -1444,111 +1485,113 @@ class Handler(BaseHTTPRequestHandler):
             broadcast()
             self._send_json(200, {"ok": True, "state": state_snapshot()})
             return
-
-        allowed_statuses = {"pending", "queued", "running", "done", "blocked"}
         try:
             body = self._read_json_body()
         except RequestError as error:
             self._send_json(error.status, {"ok": False, "error": error.message})
             return
 
-        if path.startswith("/api/node/"):
-            node_id = unquote(path[len("/api/node/"):])
-            if not node_id or "/" in node_id:
-                self._send_json(400, {"ok": False, "error": "invalid node id"})
+        # POST /api/task/{id}                  → task-level update
+        # POST /api/task/{id}/node/{node_id}   → subagent-level update
+        if path.startswith("/api/task/"):
+            rest = path[len("/api/task/"):]
+            if "/node/" in rest:
+                tid_raw, nid_raw = rest.split("/node/", 1)
+                tid, nid = unquote(tid_raw), unquote(nid_raw)
+                if not tid or not nid or "/" in nid:
+                    self._send_json(400, {"ok": False, "error": "invalid task or node id"})
+                    return
+                updates = {}
+                if "status" in body:
+                    status = body["status"]
+                    if not isinstance(status, str) or status not in NODE_STATUSES:
+                        self._send_json(400, {"ok": False, "error": f"node status must be one of {NODE_STATUSES}"})
+                        return
+                    updates["status"] = status
+                if "tokens" in body:
+                    tokens = body["tokens"]
+                    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                        self._send_json(400, {"ok": False, "error": "tokens must be a non-negative integer"})
+                        return
+                    updates["tokens"] = tokens
+                if "task" in body:
+                    label_task = body["task"]
+                    if not isinstance(label_task, str) or len(label_task) > 500:
+                        self._send_json(400, {"ok": False, "error": "task must be a string <= 500 chars"})
+                        return
+                    updates["task"] = label_task
+                if not updates:
+                    self._send_json(400, {"ok": False, "error": "provide status, tokens, or task"})
+                    return
+                if not set_node(tid, nid, _bypass_context=True, **updates):
+                    self._send_json(404, {"ok": False, "error": "task or node not found"})
+                    return
+                broadcast()
+                self._send_json(200, {"ok": True, "task": tid, "node": nid, **updates})
+                return
+
+            tid = unquote(rest)
+            if not tid or "/" in tid:
+                self._send_json(400, {"ok": False, "error": "invalid task id"})
                 return
             updates = {}
             if "status" in body:
                 status = body["status"]
-                if not isinstance(status, str) or status not in allowed_statuses:
-                    self._send_json(400, {
-                        "ok": False,
-                        "error": "status must be pending, queued, running, done, or blocked",
-                    })
+                if not isinstance(status, str) or status not in TASK_STATUSES:
+                    self._send_json(400, {"ok": False, "error": f"status must be one of {TASK_STATUSES}"})
                     return
                 updates["status"] = status
-            if "tokens" in body:
-                tokens = body["tokens"]
-                if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
-                    self._send_json(400, {
-                        "ok": False,
-                        "error": "tokens must be a non-negative integer",
-                    })
+            for key in ("title", "todo", "agent", "avatar"):
+                if key in body:
+                    value = body[key]
+                    if not isinstance(value, str) or len(value) > 500:
+                        self._send_json(400, {"ok": False, "error": f"{key} must be a string <= 500 chars"})
+                        return
+                    updates[key] = value
+            reason = None
+            if "attention_reason" in body:
+                reason = body["attention_reason"]
+                if not isinstance(reason, str) or len(reason) > 500:
+                    self._send_json(400, {"ok": False, "error": "attention_reason must be a string <= 500 chars"})
                     return
-                updates["tokens"] = tokens
-            if not updates:
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "provide at least one of status or tokens",
-                })
+            needs_attention = None
+            if "needs_attention" in body:
+                needs_attention = body["needs_attention"]
+                if not isinstance(needs_attention, bool):
+                    self._send_json(400, {"ok": False, "error": "needs_attention must be a boolean"})
+                    return
+            if not updates and reason is None and needs_attention is None:
+                self._send_json(400, {"ok": False, "error": "no valid fields to update"})
                 return
-            if not update_node(node_id, _bypass_context=True, **updates):
-                self._send_json(404, {"ok": False, "error": "node not found"})
+            if not set_task(tid, _bypass_context=True, reason=reason,
+                            needs_attention=needs_attention, **updates):
+                self._send_json(404, {"ok": False, "error": "task not found"})
                 return
             broadcast()
-            self._send_json(200, {"ok": True, "id": node_id, **updates})
+            self._send_json(200, {"ok": True, "id": tid})
             return
 
-        if path == "/api/log":
+        if path == "/api/learning":
+            text = body.get("text")
+            if not isinstance(text, str) or not text or len(text) > 2000:
+                self._send_json(400, {"ok": False, "error": "text must be a non-empty string <= 2000 chars"})
+                return
+            task_title = body.get("task", "")
+            agent = body.get("agent", "")
+            if not isinstance(task_title, str) or not isinstance(agent, str):
+                self._send_json(400, {"ok": False, "error": "task and agent must be strings"})
+                return
+            add_learning(text, task_title=task_title[:200], agent=agent[:100], _bypass_context=True)
+            broadcast()
+            self._send_json(200, {"ok": True})
+            return
+
+        if path == "/api/activity":
             msg = body.get("msg")
-            if not isinstance(msg, str) or not msg or len(msg) > 10000:
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "msg must be a non-empty string of at most 10000 characters",
-                })
+            if not isinstance(msg, str) or not msg or len(msg) > 500:
+                self._send_json(400, {"ok": False, "error": "msg must be a non-empty string <= 500 chars"})
                 return
-            add_log(msg, _bypass_context=True)
-            broadcast()
-            self._send_json(200, {"ok": True})
-            return
-
-        if path == "/api/metrics":
-            total_tokens = body.get("total_tokens")
-            total_cost = body.get("total_cost")
-            if (
-                isinstance(total_tokens, bool)
-                or not isinstance(total_tokens, int)
-                or total_tokens < 0
-            ):
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "total_tokens must be a non-negative integer",
-                })
-                return
-            if (
-                isinstance(total_cost, bool)
-                or not isinstance(total_cost, (int, float))
-                or not math.isfinite(total_cost)
-                or total_cost < 0
-            ):
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "total_cost must be a finite non-negative number",
-                })
-                return
-            with STATE_LOCK:
-                STATE["total_tokens"] = total_tokens
-                STATE["total_cost"] = total_cost
-            broadcast()
-            self._send_json(200, {"ok": True})
-            return
-
-        if path == "/api/loop-state":
-            done = body.get("done")
-            summary = body.get("summary")
-            if isinstance(done, bool) or not isinstance(done, int) or done < 0:
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "done must be a non-negative integer",
-                })
-                return
-            if not isinstance(summary, str) or len(summary) > 10000:
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "summary must be a string of at most 10000 characters",
-                })
-                return
-            update_loop_state(done=done, summary=summary, _bypass_context=True)
+            add_activity(msg, _bypass_context=True)
             broadcast()
             self._send_json(200, {"ok": True})
             return
@@ -1564,12 +1607,11 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     public_path = PATH_PREFIX or "/"
-    if load_persisted_state():
-        print("Loaded persisted state")
-    else:
-        print("Starting fresh")
-    print(f"Topology: {TOPOLOGY_SOURCE}")
-    print(f"Agent Loop Visualizer → http://127.0.0.1:{PORT}{public_path}")
+    fresh = not load_persisted_state()
+    print("Starting fresh" if fresh else "Loaded persisted state")
+    print(f"Agent Manager (v3) → http://127.0.0.1:{PORT}{public_path}")
+    if fresh and AUTO_START_DEMO:
+        restart_simulation()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     try:
         server.serve_forever()
