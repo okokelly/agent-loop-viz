@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Agent Manager (v3) — Solo dev's AI-agent management layer.
+Agent Manager (v3): a solo dev's AI-agent management layer.
 
 Two levels of visibility for one person running many agents in parallel:
 
-  * Top level   — Dashboard / Kanban / Table / Inbox across ALL tasks.
-  * Drill-down  — click any task to see its loop flowchart (orchestrator →
+  * Top level   : Dashboard / Kanban / Table / Inbox across ALL tasks.
+  * Drill-down  : click any task to see its loop flowchart (orchestrator →
                   subagents → verifier) and exactly which step is stuck.
 
 Single file, zero dependencies (Python stdlib). Agents push state over a small
 REST API; the browser updates live over SSE. Built for a single machine / one
-user — no accounts, no multi-person collaboration.
+user. No accounts, no multi-person collaboration.
 
 Reuses the SSE / persistence / cancellable-simulation machinery from v2.
 """
@@ -68,7 +68,7 @@ PATH_PREFIX = normalize_path_prefix(os.environ.get("AGENT_MGR_PATH_PREFIX", ""))
 
 # ── Data model ─────────────────────────────────────────────────
 # A *task* is owned by an agent and carries management-level fields (for the
-# Kanban / Inbox / Table) plus a *graph* — the loop it runs internally, used
+# Kanban / Inbox / Table) plus a *graph*, the loop it runs internally, used
 # for the drill-down flowchart.
 
 def build_graph(orch_task, workers, ver_task):
@@ -514,7 +514,7 @@ def simulate_loop(context):
     _thread_context.run = context
 
     reset_state()
-    add_activity("Solo dev online — 5 agents standing by")
+    add_activity("Solo dev online · 5 agents standing by")
     broadcast()
     wait_tick(0.6)
 
@@ -548,7 +548,7 @@ def simulate_loop(context):
     burn("t1", "ver", 2200)
     set_node("t1", "ver", status="done")
     set_task("t1", status="done", todo="Merged to feature/jwt-auth")
-    add_activity("auth-agent 🔐 ✅ done — all 42 auth tests green")
+    add_activity("auth-agent 🔐 ✅ done · all 42 auth tests green")
 
     # ── t2: API docs (dispatch, mid-flight) ──────────────────────
     _dispatch("t2", "Enumerating endpoints from routes")
@@ -576,8 +576,8 @@ def simulate_loop(context):
     set_node("t3", "w1", status="blocked")
     set_task("t3", status="blocked",
              todo="Needs macOS runner secret to reproduce",
-             reason="Blocked: missing CI secret MACOS_RUNNER_TOKEN — needs you")
-    add_activity("ci-agent 🧪 ⛔ BLOCKED — missing MACOS_RUNNER_TOKEN")
+             reason="Blocked: missing CI secret MACOS_RUNNER_TOKEN, needs you")
+    add_activity("ci-agent 🧪 ⛔ BLOCKED · missing MACOS_RUNNER_TOKEN")
     add_learning("Flake only repros on macOS runners; Linux is clean. Root "
                  "cause is a timer race, not the test itself.", "Fix flaky CI on macOS",
                  "ci-agent")
@@ -604,9 +604,9 @@ def simulate_loop(context):
     burn("t4", "ver", 1500)
     set_node("t4", "ver", status="done")
     set_task("t4", status="review",
-             todo="PR #128 open — needs your review",
+             todo="PR #128 open, needs your review",
              reason="Ready for review: 6 files, +214 −58 · visual diff attached")
-    add_activity("ui-agent 🎨 🔍 ready for review — PR #128")
+    add_activity("ui-agent 🎨 🔍 ready for review · PR #128")
 
     # ── t5 stays in Todo; final summary ──────────────────────────
     add_activity("Board: 1 done · 1 in-progress · 1 review · 1 blocked · 1 todo")
@@ -1023,7 +1023,7 @@ function viewDashboard(state){
   // learnings
   const lp=el('div','panel');lp.appendChild(el('h3','','🧠 Shared memory · learnings'));
   const lb=el('div','body');
-  if(!state.learnings.length){const e=el('div','empty');e.append(el('span','big','🧠'),document.createTextNode('No learnings yet — agents leave notes here for each other.'));lb.appendChild(e);}
+  if(!state.learnings.length){const e=el('div','empty');e.append(el('span','big','🧠'),document.createTextNode('No learnings yet. Agents leave notes here for each other.'));lb.appendChild(e);}
   state.learnings.forEach(x=>{
     const d=el('div','learn');d.appendChild(el('span','bulb','💡'));
     const mid=el('div');
@@ -1148,7 +1148,7 @@ function viewTable(state){
 function viewInbox(state){
   const wrap=el('div','inbox');
   const items=inbox(state).filter(matchFilter);
-  if(!items.length){const e=el('div','empty');e.append(el('span','big','📭'),document.createTextNode('Inbox zero — nothing needs you right now.'));wrap.appendChild(e);return wrap;}
+  if(!items.length){const e=el('div','empty');e.append(el('span','big','📭'),document.createTextNode('Inbox zero. Nothing needs you right now.'));wrap.appendChild(e);return wrap;}
   items.forEach(t=>{
     const row=el('div','ibx');row.style.setProperty('--cc',css('--'+CVAR[t.status]));
     row.appendChild(el('div','ic',t.status==='blocked'?'⛔':'🔍'));

@@ -1,30 +1,33 @@
 # Agent Manager (v3)
 
-A **solo developer's management layer for AI agents**. Not a chat tool — a place
-to manage the several agents you're running in parallel the way you'd manage a
-team: Kanban, Table, Dashboard, Inbox. Single machine, one user, no accounts, no
-team/collaboration features.
+**A control room for the solo developer running many AI agents at once.** Past
+three or four agents in parallel, the hard part stops being any single agent. It
+becomes *keeping track of all of them*: who's making progress, who's blocked, who's
+waiting on you to review. Instead of holding that in your head across a dozen
+terminal windows, you get one live board (Kanban, Table, Dashboard, Inbox), and
+can open any task to watch its loop and see exactly which subagent is stuck. A
+place to *manage* your agents, not just chat with them.
 
-> Solo ≠ single agent. One person running 5 agents at once *is* managing a team —
+> Solo ≠ single agent. One person running 5 agents at once *is* managing a team;
 > the team just happens to be agents. v3 keeps the management layer and drops
 > only the multi-person parts (sharing, per-person permissions, team canvases).
 
 ## Two levels of visibility
 
-**Top level — across all tasks**
-- **Dashboard** — counts by status, a live activity feed, and **shared memory**
+**Top level: across all tasks**
+- **Dashboard**: counts by status, a live activity feed, and **shared memory**
   (learnings each agent leaves for the next one, so they stop re-deriving the
   same project facts).
-- **Kanban** — Todo / In Progress / Review / Blocked / Done. Cards show the
+- **Kanban**: Todo / In Progress / Review / Blocked / Done. Cards show the
   agent, its current step, and a mini loop-progress bar.
-- **Table** — the same tasks, dense and sortable-by-eye.
-- **Inbox** — only the tasks that need *you* (blocked or ready-for-review), each
+- **Table**: the same tasks, dense and sortable-by-eye.
+- **Inbox**: only the tasks that need *you* (blocked or ready-for-review), each
   with the reason. This is the "which window was waiting on me?" fix.
 
-**Drill-down — one task**
+**Drill-down: one task**
 - Click any task to open its **loop flowchart**: orchestrator → subagents →
   verifier, with live status and token burn per node. A blocked or long-running
-  subagent is highlighted, so you see **exactly which step is stuck** — the
+  subagent is highlighted, so you see **exactly which step is stuck**. It's the
   visualizer carried over from v1/v2, now scoped to a single task.
 
 ## Quick start
@@ -41,12 +44,12 @@ Set `AGENT_MGR_AUTOSTART=0` to launch with a quiet board instead.
 
 ### UI you can drive
 - **Drag & drop** cards between Kanban columns → pushes a status change.
-- **Inbox quick actions** — *Unblock* a blocked task, *Approve → Done* or *Send
-  back* a review — same buttons live in the drill-down modal.
+- **Inbox quick actions**: *Unblock* a blocked task, *Approve → Done* or *Send
+  back* a review. The same buttons live in the drill-down modal.
 - **Search** (`/` to focus) filters tasks across Kanban / Table / Inbox.
-- **Sortable table** — click any column header.
-- **Keyboard** — `1`–`4` switch views, `/` search, `Esc` close modal. The 🔔
-  bell (with a count) jumps to whatever needs you.
+- **Sortable table**: click any column header.
+- **Keyboard**: `1`/`2`/`3`/`4` switch views, `/` focuses search, `Esc` closes the
+  modal. The 🔔 bell (with a count) jumps to whatever needs you.
 
 Optional path prefix for a reverse proxy:
 
@@ -60,18 +63,18 @@ AGENT_MGR_PATH_PREFIX=/agents python3 server.py 8768
 The browser updates live over SSE. Your agents push state over a small REST API
 (`data source = agents report`). All endpoints return `{"ok": true}` on success.
 
-### `POST /api/task/{id}` — task-level (feeds Kanban / Inbox / Table)
+### `POST /api/task/{id}`: task-level (feeds Kanban / Inbox / Table)
 ```bash
 curl -X POST http://127.0.0.1:8768/api/task/t3 \
   -H 'Content-Type: application/json' \
   -d '{"status":"blocked","todo":"needs macOS runner secret",
-       "attention_reason":"Blocked: missing MACOS_RUNNER_TOKEN — needs you"}'
+       "attention_reason":"Blocked: missing MACOS_RUNNER_TOKEN, needs you"}'
 ```
 Fields: `status` (`todo|running|review|blocked|done`), `title`, `todo`, `agent`,
 `avatar`, `attention_reason`, `needs_attention`. A task set to `review`/`blocked`
 enters the Inbox automatically.
 
-### `POST /api/task/{id}/node/{node_id}` — subagent-level (feeds the drill-down loop)
+### `POST /api/task/{id}/node/{node_id}`: subagent-level (feeds the drill-down loop)
 ```bash
 curl -X POST http://127.0.0.1:8768/api/task/t3/node/w1 \
   -H 'Content-Type: application/json' \
@@ -79,7 +82,7 @@ curl -X POST http://127.0.0.1:8768/api/task/t3/node/w1 \
 ```
 Node `status`: `pending|queued|running|done|blocked`.
 
-### `POST /api/learning` — append to shared memory
+### `POST /api/learning`: append to shared memory
 ```bash
 curl -X POST http://127.0.0.1:8768/api/learning \
   -H 'Content-Type: application/json' \
@@ -87,9 +90,9 @@ curl -X POST http://127.0.0.1:8768/api/learning \
        "task":"Refactor auth → JWT","agent":"auth-agent"}'
 ```
 
-### `POST /api/activity` — one line to the activity feed
-### `POST /api/reset` — clear the board and reload the demo tasks
-### `GET  /api/state` — current state as JSON (debugging)
+### `POST /api/activity`: one line to the activity feed
+### `POST /api/reset`: clear the board and reload the demo tasks
+### `GET  /api/state`: current state as JSON (debugging)
 
 ### Integration sketch
 ```python
@@ -111,14 +114,14 @@ def on_blocked(task_id, why):
 task {
   id, title, agent, avatar, status, todo,
   needs_attention, attention_reason, tags, tokens, updated_at,
-  graph: {                      # ← the drill-down loop
+  graph: {                      # the drill-down loop
     viewBox,
     nodes: [ {id, label, x, y, status, tokens, task} ],
     edges: [ {from, to, label} ]
   }
 }
 learnings: [ {time, task, agent, text} ]   # shared memory
-activity:  [ "[hh:mm:ss] …" ]              # global feed
+activity:  [ "[hh:mm:ss] ..." ]            # global feed
 ```
 
 ## Architecture
@@ -140,7 +143,7 @@ cancellable-simulation threading model.
 
 Multi-person sharing, per-person file permissions, custom/whiteboard views, and
 the full Role/Apprentice system with verification rules. Those are the team-scale
-and long-term-moat features — out of scope for the solo MVP.
+and long-term-moat features, out of scope for the solo MVP.
 
 ## License
 
