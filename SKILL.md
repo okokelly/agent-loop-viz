@@ -1,245 +1,149 @@
 ---
-name: agent-loop-viz
-description: "Build real-time SVG flowchart dashboards for multi-agent loop execution — live node status, per-agent token tracking, SSE streaming, block detection. Use when the user wants to visualize a delegate_task or multi-agent workflow instead of running it blind in the background."
-version: 2.0.0
+name: agent-manager
+description: "A solo developer's management layer for AI agents — manage many agents in parallel like a team (Kanban / Table / Dashboard / Inbox) with a per-task loop flowchart drill-down. Single-file Python server, SSE streaming, REST push API. Use when someone runs several agents at once and needs to see, at a glance, what each is doing and which one needs them — not just chat with one agent at a time."
+version: 3.0.0
 category: autonomous-ai-agents
 ---
 
-# Agent Loop Visualizer
+# Agent Manager (v3)
 
-A single-file Python server that renders a live SVG flowchart of agent loop execution. Orchestrator → workers → verifier, with real-time status, token counters, cost tracking, and block detection. Zero dependencies beyond Python stdlib.
+A single-file Python server that turns "several agents running in parallel" into
+a board you manage like a team. Two levels of visibility:
+
+- **Top level** — Dashboard / Kanban / Table / Inbox across *all* tasks.
+- **Drill-down** — click any task to see its loop flowchart (orchestrator →
+  subagents → verifier) and exactly which subagent is stuck.
+
+Built for one person on one machine. No accounts, no multi-person collaboration.
+Zero dependencies beyond the Python stdlib.
 
 ## When to Use
 
-- User wants to **see** what a multi-agent loop is doing right now (not just get the final result)
-- Running orchestrator + workers + verifier patterns and need to know which agent is consuming tokens
-- Debugging blocked subagents — the visualizer shows exactly which node is stuck and why
-- Building trust in autonomous loops before graduating them to unattended cron jobs
+- Someone is running **3+ agents at once** and tracking them "in their head."
+- They keep losing track of **which window is waiting on them** (a blocked agent,
+  a PR ready for review) — the Inbox is exactly this.
+- They want agents to **share context** so the next agent doesn't re-derive (or
+  re-mistake) project facts — the shared-memory learnings feed.
+- Debugging a stuck loop: the drill-down shows **which subagent blocked and why**.
+
+This is the management-layer sibling of the v1/v2 "Agent Loop Visualizer" — that
+single-loop flowchart is now the *drill-down* inside a multi-task board.
 
 ## Architecture
 
 ```
-Browser ← SSE stream → Python server (single file, stdlib)
-                           ├── / → embedded HTML/SVG dashboard
-                           ├── /stream → SSE endpoint pushing live state
-                           ├── /api/* → REST endpoints for external agent state updates
-                           └── POST /control → play/pause/speed/restart
+Browser ← SSE ← Python server (single file, stdlib)
+                  ├── /                → HTML dashboard (Dashboard/Kanban/Table/Inbox + modal)
+                  ├── /stream          → SSE endpoint pushing live state
+                  ├── /api/task/*      → agent push: task-level + subagent-level
+                  ├── /api/learning    → shared-memory learnings
+                  ├── /api/activity    → activity feed
+                  ├── /api/reset       → clear board, reload demo tasks
+                  └── /control         → play / pause / restart the demo
 ```
 
-- **Server**: Python `http.server` + `threading`, single file
-- **Frontend**: SVG flowchart (nodes + edges), light theme by default with dark mode toggle. Node shapes are filled with status color (not just borders).
-- **Streaming**: Server-Sent Events — server pushes state updates, frontend re-renders SVG
-- **States**: `pending` (grey) → `queued` (gold) → `running` (yellow, pulsing) → `done` (green) | `blocked` (red)
+- **Server**: Python `http.server` + `threading`, single file.
+- **Frontend**: embedded HTML/CSS/JS. Views render from one live STATE snapshot;
+  the drill-down reuses the SVG flowchart from v1/v2.
+- **Streaming**: Server-Sent Events — server pushes, browser re-renders.
+- **Persistence**: atomic auto-save to `agent-manager-state.json`, reloaded on
+  restart if < 24h old.
 
-## Dashboard Layout
+Reuses v2's hardened SSE broadcast, atomic persistence, and cancellable-simulation
+threading model.
 
-Three panels:
+## Data Model
 
-| Panel | Content |
-|-------|---------|
-| **Header** | Goal description, elapsed time, total tokens, total cost, dark mode toggle |
-| **Canvas** | SVG flowchart: orchestrator → workers → verifier, edges colored by completion, zoom/pan support |
-| **Sidebar** | Event log (timestamped, color-coded) + LOOP-STATE.md summary |
+A **task** is owned by an agent and carries management-level fields plus a `graph`
+(its internal loop, shown in the drill-down):
 
-Each node on the canvas shows: role label, task description, live token counter, status indicator (dot + border color), and a BLOCKED badge when stuck.
+```
+task {
+  id, title, agent, avatar,
+  status,                       # todo | running | review | blocked | done
+  todo, tags, tokens, updated_at,
+  needs_attention, attention_reason,
+  graph: {
+    viewBox,
+    nodes: [ {id, label, x, y, status, tokens, task} ],  # subagents
+    edges: [ {from, to, label} ]
+  }
+}
+learnings: [ {time, task, agent, text} ]   # shared memory
+activity:  [ "[hh:mm:ss] …" ]              # global feed
+```
+
+Setting a task to `review` or `blocked` puts it in the **Inbox** automatically.
 
 ## Quick Start
 
 ```bash
-# Default topology (built-in GSB demo)
-python3 server.py 8767
-# → http://localhost:8767
-
-# Custom topology
-python3 server.py 8767 --topology my-topology.json
-# or: AGENT_VIZ_TOPOLOGY=my-topology.json python3 server.py 8767
-# → http://localhost:8767
+python3 server.py 8768
+# → http://127.0.0.1:8768
 ```
 
-For public access, add a cloudflared tunnel:
-```bash
-~/bin/cloudflared tunnel --url http://localhost:8767
-```
+The built-in solo-dev demo **auto-runs on first launch** (5 agents; one blocks,
+one lands in review). Set `AGENT_MGR_AUTOSTART=0` for a quiet board. Path prefix
+for a reverse proxy: `AGENT_MGR_PATH_PREFIX=/agents python3 server.py 8768`.
 
-## Topology Config
-
-Define custom node graphs in JSON — no Python editing needed:
-
-```json
-{
-  "goal": "My Research Project",
-  "viewBox": [0, 0, 900, 700],
-  "nodes": [
-    {"id": "orch", "label": "Orchestrator", "x": 450, "y": 35, "task": "Plan and dispatch"},
-    {"id": "w1", "label": "Worker A", "x": 250, "y": 150, "task": "Process dataset A"}
-  ],
-  "edges": [
-    {"from": "orch", "to": "w1", "label": "delegate"}
-  ]
-}
-```
-
-Load via `--topology path.json` CLI flag or `AGENT_VIZ_TOPOLOGY` env var. Falls back to the built-in GSB demo topology if neither is provided.
-
-## REST API for Real Execution
-
-The server now exposes REST endpoints so external agents (or Hermes `delegate_task` calls) can push real state updates instead of relying on the simulated loop.
+## REST API — how real agents feed it
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/state` | GET | Return current STATE as JSON (debugging) |
-| `/api/reset` | POST | Reset all state for a new run |
-| `/api/node/{id}` | POST | Update node status + token count |
-| `/api/log` | POST | Push a timestamped log entry |
-| `/api/metrics` | POST | Set total_tokens + total_cost |
-| `/api/loop-state` | POST | Update loop_state fields |
+| `/api/state` | GET | Current STATE as JSON (debugging) |
+| `/api/task/{id}` | POST | Task-level update (feeds Kanban / Inbox / Table) |
+| `/api/task/{id}/node/{node_id}` | POST | Subagent-level update (feeds the drill-down loop) |
+| `/api/learning` | POST | Append a learning to shared memory |
+| `/api/activity` | POST | Push one line to the activity feed |
+| `/api/reset` | POST | Reset the board and reload demo tasks |
 
-### Node update payload
-```json
-{"status": "running", "tokens": 2500}
-```
-Valid statuses: `pending`, `queued`, `running`, `done`, `blocked`. Status defaults to `pending` if omitted.
-
-### Integration with delegate_task
 ```python
 import requests
-VIZ = "http://localhost:8767"
+VIZ = "http://127.0.0.1:8768"
 
-# Before dispatching
-requests.post(f"{VIZ}/api/reset")
-requests.post(f"{VIZ}/api/node/orch", json={"status": "running"})
+# a subagent stepped forward
+requests.post(f"{VIZ}/api/task/t3/node/w1", json={"status": "running", "tokens": 3300})
 
-# After each subagent completes
-requests.post(f"{VIZ}/api/node/f1", json={"status": "done", "tokens": 12500})
-requests.post(f"{VIZ}/api/log", json={"msg": "Farm:Frameworks — 5/5 subagents complete"})
-requests.post(f"{VIZ}/api/metrics", json={"total_tokens": 485000, "total_cost": 0.211})
+# the whole task is now blocked on you
+requests.post(f"{VIZ}/api/task/t3", json={
+    "status": "blocked",
+    "attention_reason": "Blocked: missing MACOS_RUNNER_TOKEN — needs you",
+})
+
+# leave context for the next agent
+requests.post(f"{VIZ}/api/learning", json={
+    "text": "Flake only repros on macOS runners; root cause is a timer race.",
+    "task": "Fix flaky CI on macOS", "agent": "ci-agent",
+})
 ```
 
-API calls bypass the simulation `RunContext` check — they work whether or not a simulation is running.
+Task status: `todo | running | review | blocked | done`. Node status:
+`pending | queued | running | done | blocked`. API writes use `_bypass_context`,
+so they apply whether or not the demo simulation is running.
 
-## State Persistence
+## UI You Can Drive
 
-The dashboard auto-saves state to `agent-viz-state.json` on every broadcast. On restart, the file is reloaded if it's less than 24 hours old. Add to `.gitignore` — it's a runtime artifact, not source code.
-
-## Simulated vs Real Execution
-
-The server ships with a **simulated loop** (`simulate_loop()` function) for demo purposes — it steps through a realistic multi-agent research flow with randomized token counts.
-
-**To hook up real execution:**
-
-1. Start the server: `python3 server.py 8767 --topology my-topology.json`
-2. From your orchestrator, POST to `/api/reset` to clear state
-3. As each `delegate_task` or subagent completes, POST to `/api/node/{id}` and `/api/log`
-4. Update `/api/metrics` periodically with real token/cost data
-5. The SSE broadcast pushes all changes to connected browsers in real time
-
-The `simulate_loop()` demo can coexist with real execution — click "Start" for the demo, or use the API to drive real data. API calls cancel any running simulation automatically.
-
-## UI Features
-
-### Dark/Light Mode
-Toggle button (🌙/☀️) in the header. Switches all CSS colors via custom properties. Preference persisted to `localStorage`.
-
-### SVG Zoom/Pan
-- **Mouse wheel** over the canvas: zoom in/out (0.5× to 3×)
-- **Click and drag** on the canvas: pan
-- **Reset view** button appears when zoomed or panned
-- Node click targets preserved at all zoom levels
-
-## Node State Machine
-
-```
-pending ──→ queued ──→ running ──→ done
-                          │
-                          └──→ blocked
-```
-
-**Light mode colors** (default):
-```
-pending=#eaeef2 (light gray)
-queued=#fff3cd (light gold)
-running=#fff8e1 (light yellow)
-done=#dafbe1 (light green)
-blocked=#ffd8d8 (light red)
-warning=#ffe8cc (light orange)
-```
-
-**Dark mode colors:**
-```
-pending=#21262d, queued=#3b3000, running=#1a3a2a, done=#173b24, blocked=#490202
-```
-
-When building a new viz server, default to light mode with the GitHub-style color scheme (#f6f8fa background, #fff white cards, #0969da blue accents).
-
-Edge colors in light mode: running=#e6c300 (pulsing yellow), done=#a8e6cf (green), pending=#d0d7de (gray border).
-Node fill: status color directly (e.g., done nodes are filled green, running nodes are filled yellow). Border is subtle #d0d7de for contrast.
-Node text: #1f2328 for labels, #656d76 for descriptions.
-Edge label background: #f6f8fa.
-
-## Cloudflared Deployment with Custom Path
-
-To deploy at a subpath on an existing domain (e.g., `kellyjia.com/temp0717`), two layers must align:
-
-### 1. Named Tunnel Config (`~/.cloudflared/config.yml`)
-
-```yaml
-ingress:
-  - hostname: kellyjia.com
-    path: /temp0717
-    service: http://localhost:8768
-```
-
-After editing, reload the tunnel: `kill -HUP <pid>` (preferred — no downtime for other routes) or full restart `kill <pid>; ~/bin/cloudflared tunnel run <name> &`.
-
-### 2. Server Path Handling
-
-**Critical**: cloudflared passes the full subpath through to the backend — it does NOT strip the prefix. If the server only handles `/`, requests to `/temp0717/` get 404.
-The server must:
-- Serve HTML at both `/` (localhost) and `/temp0717/` (public URL)
-- Adjust the EventSource path in JS so SSE connects to `/temp0717/stream` instead of `/stream`
-- Redirect bare `/temp0717` → `/temp0717/` to avoid relative-resource breakage
-
-### Diagnosing Tunnel + Path Issues
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| 502 | Tunnel up but can't reach localhost | Server process died or wrong port. Check `lsof -i:PORT` |
-| 404 on custom path | Server doesn't handle the prefix | Add path handler as above |
-| 404 on `/` but 200 on `/temp0717/` | Forgot the localhost `/` case | Keep both `/` and `/prefix/` handlers |
-| `ERR_HTTP_RESPONSE_CODE_FAILURE` in browser | Tunnel not yet propagated | Wait 5-10s after tunnel start, retry |
-
-## Mobile Responsiveness
-
-The dashboard must work on phone screens (~375px wide). Key patterns:
-
-### SVG Scaling
-```html
-<svg viewBox="0 0 900 600" preserveAspectRatio="xMidYMid meet"></svg>
-```
-CSS: `width:100%; height:auto` — the viewBox handles proportional scaling; `meet` ensures the full diagram fits.
-
-### Log Panel on Mobile
-On screens <768px, the log panel becomes a slide-over overlay instead of squeezing the canvas.
-
-### Touch Targets
-All interactive elements need `min-height:32px; min-width:32px` — Apple HIG minimum.
-
-### Body Scroll Lock
-```css
-body{overflow:hidden} /* prevents whole-page scroll on mobile */
-#logs{overflow-y:auto; overscroll-behavior:contain} /* only log panel scrolls */
-```
+- **Drag & drop** Kanban cards between columns → POSTs a task status change.
+- **Quick actions** — *Unblock* (blocked), *Approve → Done* / *Send back* (review)
+  in both the Inbox and the drill-down modal.
+- **Search** (`/` to focus) filters across Kanban / Table / Inbox.
+- **Sortable table** — click a column header.
+- **Keyboard** — `1`–`4` switch views, `/` search, `Esc` close modal; the 🔔 bell
+  (with count) jumps to whatever needs you.
+- **Light/dark** toggle, persisted to `localStorage`.
 
 ## Pitfalls
 
-- **Port conflicts**: `lsof -ti:PORT | xargs kill -9` before restart. Especially when a previous server instance didn't fully exit.
-- **Port 8766 reserved**: A legacy Python process on Kelly's machine keeps port 8766 occupied (recall webhook). Use 8767+ for new services.
-- **API calls vs simulation**: The REST API cancels any running simulation before accepting writes. If you need both, run two server instances on different ports.
-- **`agent-viz-state.json` is a runtime artifact**: Add it to `.gitignore`. The server auto-creates and overwrites it on every broadcast.
-- **SSE reconnect**: Frontend auto-reconnects via `EventSource`, but if the server restarts mid-simulation, the state resets (unless persisted state was loaded on boot).
-- **Single-file constraint**: All HTML/CSS/JS is embedded as a Python string. This is deliberate for zero-dependency deployment but makes the file long (~1,500 lines). Edit with care — the HTML string uses `r"""..."""` raw strings.
-- **`&` backgrounding blocked**: Hermes terminal rejects `command &` in foreground mode. Use `terminal(background=true)` for long-lived processes.
-- **Cloudflared path routing**: cloudflared passes the full subpath to the backend without stripping. Server must handle the prefix explicitly (see Cloudflared Deployment section above). Unlike nginx `proxy_pass` which can strip paths.
-- **Tunnel HUP reload**: After editing `config.yml`, `kill -HUP <pid>` reloads without downtime. If new routes aren't picked up, a full restart (`kill` then restart) is needed.
-- **502 vs 404 diagnosis**: 502 = tunnel alive but backend unreachable (server down). 404 = tunnel routing works but server doesn't handle the path. These point to different fixes.
-- **Publishing: scrub personal paths before git push.** The `simulate_loop()` log messages often contain local paths. Run a broad grep (`amber|kelly|~/amber-os|/Users/`) before pushing. Replace with generic project names.
+- **Port conflicts**: `lsof -ti:PORT | xargs kill` before restart; a previous
+  instance may still hold the port.
+- **`agent-manager-state.json` is a runtime artifact** — it's in `.gitignore`;
+  the server creates/overwrites it on every broadcast.
+- **Single-file constraint**: all HTML/CSS/JS is embedded as a Python raw string
+  (`r"""..."""`). Deliberate for zero-dependency deploy; edit with care.
+- **Auto-start vs persisted state**: on boot the server loads persisted state if
+  fresh (< 24h) and only auto-runs the demo when starting clean. Delete the state
+  file (or `AGENT_MGR_AUTOSTART=0`) to control which happens.
+- **SSE reconnect**: the browser auto-reconnects via `EventSource`; a mid-run
+  server restart resets state unless persisted state was reloaded on boot.
+- **Scrub personal paths before publishing**: demo/log strings can carry local
+  paths — grep before pushing.

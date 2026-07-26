@@ -1,18 +1,5 @@
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-
-# Python
+agent-manager-state.json
+agent-manager-state.json.tmp
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-
-# Temp
-*.tmp
-*.swp
-*~
-agent-viz-state.json
+*.pyc
+.DS_Store
