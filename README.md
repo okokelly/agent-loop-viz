@@ -139,7 +139,7 @@ Browser ← SSE ← Python server (single file, stdlib only)
 Ported from v2: the SSE broadcast, atomic state persistence, and the
 cancellable-simulation threading model.
 
-## Not in this MVP (deliberately)
+## Not in this MVP 
 
 Multi-person sharing, per-person file permissions, custom/whiteboard views, and
 the full Role/Apprentice system with verification rules. Those are the team-scale
